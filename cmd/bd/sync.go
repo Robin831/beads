@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/importer"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/syncbranch"
 )
@@ -589,6 +590,26 @@ func doPullFirstSync(ctx context.Context, jsonlPath string, renameOnImport, noGi
 	// Display manual conflicts that need user resolution
 	if len(mergeResult.ManualConflicts) > 0 {
 		displayManualConflicts(mergeResult.ManualConflicts)
+	}
+
+	// Step 5.5: Apply rename-on-import to merged state BEFORE importing
+	// This ensures the JSONL file is written with renamed IDs, not just the database
+	if renameOnImport {
+		fmt.Println("→ Renaming merged issues to match database prefix...")
+		// Get configured prefix from database
+		configuredPrefix, err := store.GetConfig(ctx, "issue_prefix")
+		if err != nil {
+			return fmt.Errorf("failed to get configured prefix: %w", err)
+		}
+		if configuredPrefix == "" {
+			return fmt.Errorf("cannot rename: issue_prefix not configured in database")
+		}
+		
+		// Import the rename function from internal/importer
+		if err := importer.RenameImportedIssuePrefixes(mergeResult.Merged, configuredPrefix); err != nil {
+			return fmt.Errorf("failed to rename merged issues: %w", err)
+		}
+		fmt.Printf("  Renamed issues to prefix: %s-\n", configuredPrefix)
 	}
 
 	// Step 6: Import merged state to DB
@@ -1326,7 +1347,6 @@ func init() {
 	syncCmd.Flags().Bool("check", false, "Pre-sync integrity check: detect forced pushes, prefix mismatches, and orphaned issues")
 	syncCmd.Flags().Bool("accept-rebase", false, "Accept remote sync branch history (use when force-push detected)")
 	syncCmd.Flags().Bool("full", false, "Full sync: pull → merge → export → commit → push (legacy behavior)")
-	syncCmd.Flags().Bool("rename-on-import", false, "Automatically rename imported issues to match configured prefix (fixes mixed-prefix repositories)")
 	syncCmd.Flags().Bool("resolve", false, "Resolve pending sync conflicts")
 	syncCmd.Flags().Bool("ours", false, "Use 'ours' strategy for conflict resolution (with --resolve)")
 	syncCmd.Flags().Bool("theirs", false, "Use 'theirs' strategy for conflict resolution (with --resolve)")
