@@ -109,6 +109,7 @@ Commands:
   bd sync --resolve    Resolve conflicts (uses configured strategy)
   bd sync --force      Force full export/import (skip incremental)
   bd sync --full       Full sync: pull → merge → export → commit → push (legacy)
+  bd sync --full --rename-on-import  Full sync with automatic prefix normalization
 
 Conflict Resolution:
   bd sync --resolve              Use configured conflict.strategy
@@ -1325,6 +1326,7 @@ func init() {
 	syncCmd.Flags().Bool("check", false, "Pre-sync integrity check: detect forced pushes, prefix mismatches, and orphaned issues")
 	syncCmd.Flags().Bool("accept-rebase", false, "Accept remote sync branch history (use when force-push detected)")
 	syncCmd.Flags().Bool("full", false, "Full sync: pull → merge → export → commit → push (legacy behavior)")
+	syncCmd.Flags().Bool("rename-on-import", false, "Automatically rename imported issues to match configured prefix (fixes mixed-prefix repositories)")
 	syncCmd.Flags().Bool("resolve", false, "Resolve pending sync conflicts")
 	syncCmd.Flags().Bool("ours", false, "Use 'ours' strategy for conflict resolution (with --resolve)")
 	syncCmd.Flags().Bool("theirs", false, "Use 'theirs' strategy for conflict resolution (with --resolve)")
