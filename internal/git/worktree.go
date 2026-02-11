@@ -58,6 +58,13 @@ func (wm *WorktreeManager) CreateBeadsWorktree(branch, worktreePath string) erro
 		return fmt.Errorf("failed to create worktree parent directory: %w", err)
 	}
 
+	// GH#Windows: Ensure worktree directory itself exists before git worktree add
+	// On Windows, git may try to create .git file before creating the worktree directory
+	// This prevents "The system cannot find the path specified" errors
+	if err := os.MkdirAll(worktreePath, 0750); err != nil {
+		return fmt.Errorf("failed to create worktree directory: %w", err)
+	}
+
 	// Check if branch exists remotely or locally
 	branchExists := wm.branchExists(branch)
 

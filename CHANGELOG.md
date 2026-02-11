@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows: worktree creation path error** - Fixed "The system cannot find the path specified" error during sync branch worktree creation on Windows by ensuring worktree directory exists before calling git worktree add
+
 ## [0.49.6] - 2026-02-08
 
 ### Reverted
