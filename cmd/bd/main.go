@@ -727,6 +727,12 @@ var rootCmd = &cobra.Command{
 		// Auto-export: write git-tracked JSONL for portability if enabled and due
 		maybeAutoExport(rootCtx)
 
+		// Auto GitHub sync: push the changed issue to GitHub if enabled.
+		// Runs after backup so external_ref writes from auto-sync are included.
+		if commandDidWrite.Load() {
+			maybeAutoGitHubSync(rootCtx, GetLastTouchedID())
+		}
+
 		// Auto-push: push to Dolt remote if enabled and due.
 		// Skip for read-only commands to avoid unnecessary network operations
 		// and metadata writes on commands like bd list/show/ready (GH#2191).

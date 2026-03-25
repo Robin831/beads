@@ -69,12 +69,13 @@ var githubReposCmd = &cobra.Command{
 }
 
 var (
-	githubSyncDryRun   bool
-	githubSyncPullOnly bool
-	githubSyncPushOnly bool
-	githubPreferLocal  bool
-	githubPreferGitHub bool
-	githubPreferNewer  bool
+	githubSyncDryRun      bool
+	githubSyncPullOnly    bool
+	githubSyncPushOnly    bool
+	githubSyncPushOpenOnly bool
+	githubPreferLocal     bool
+	githubPreferGitHub    bool
+	githubPreferNewer     bool
 )
 
 // GitHubConflictStrategy defines how to resolve conflicts between local and GitHub versions.
@@ -147,6 +148,7 @@ func init() {
 	githubSyncCmd.Flags().BoolVar(&githubSyncDryRun, "dry-run", false, "Show what would be synced without making changes")
 	githubSyncCmd.Flags().BoolVar(&githubSyncPullOnly, "pull-only", false, "Only pull issues from GitHub")
 	githubSyncCmd.Flags().BoolVar(&githubSyncPushOnly, "push-only", false, "Only push issues to GitHub")
+	githubSyncCmd.Flags().BoolVar(&githubSyncPushOpenOnly, "push-open-only", false, "Only push open/in-progress beads to GitHub (skip closed)")
 
 	// Conflict resolution flags (mutually exclusive)
 	githubSyncCmd.Flags().BoolVar(&githubPreferLocal, "prefer-local", false, "On conflict, keep local beads version")
@@ -327,6 +329,23 @@ func runGitHubRepos(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// buildGitHubEngine creates and initialises a tracker Engine for GitHub.
+// out may be nil (messages are silently dropped).
+func buildGitHubEngine(ctx context.Context, out interface{ Write([]byte) (int, error) }) (*tracker.Engine, error) {
+	gt := &github.Tracker{}
+	if err := gt.Init(ctx, store); err != nil {
+		return nil, fmt.Errorf("initializing GitHub tracker: %w", err)
+	}
+
+	engine := tracker.NewEngine(gt, store, actor)
+	if out != nil {
+		engine.OnMessage = func(msg string) { _, _ = fmt.Fprintln(out, "  "+msg) }
+	}
+	engine.OnWarning = func(msg string) { _, _ = fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
+	engine.PullHooks = buildGitHubPullHooks(ctx)
+	return engine, nil
+}
+
 // runGitHubSync implements the github sync command.
 // Uses the tracker.Engine for all sync operations.
 func runGitHubSync(cmd *cobra.Command, args []string) error {
@@ -356,19 +375,10 @@ func runGitHubSync(cmd *cobra.Command, args []string) error {
 	out := cmd.OutOrStdout()
 	ctx := context.Background()
 
-	// Create and initialize the GitHub tracker
-	gt := &github.Tracker{}
-	if err := gt.Init(ctx, store); err != nil {
-		return fmt.Errorf("initializing GitHub tracker: %w", err)
+	engine, err := buildGitHubEngine(ctx, out)
+	if err != nil {
+		return err
 	}
-
-	// Create the sync engine
-	engine := tracker.NewEngine(gt, store, actor)
-	engine.OnMessage = func(msg string) { _, _ = fmt.Fprintln(out, "  "+msg) }
-	engine.OnWarning = func(msg string) { _, _ = fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
-
-	// Set up GitHub-specific pull hooks
-	engine.PullHooks = buildGitHubPullHooks(ctx)
 
 	// Build sync options from CLI flags
 	pull := !githubSyncPushOnly
@@ -378,6 +388,9 @@ func runGitHubSync(cmd *cobra.Command, args []string) error {
 		Pull:   pull,
 		Push:   push,
 		DryRun: githubSyncDryRun,
+	}
+	if githubSyncPushOpenOnly {
+		opts.State = "open"
 	}
 
 	// Map conflict resolution
