@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	net_url "net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -380,6 +381,35 @@ func (c *Client) RemoveLabel(ctx context.Context, number int, label string) erro
 		return fmt.Errorf("failed to remove label %q from issue #%d: %w", label, number, err)
 	}
 	return nil
+}
+
+// SearchOpenIssuesByTitle searches for open issues in this repo with exactly the given title.
+// Returns matching issues; returns nil slice (not an error) when none are found.
+func (c *Client) SearchOpenIssuesByTitle(ctx context.Context, title string) ([]Issue, error) {
+	// GitHub Search API uses a different base path (/search/issues, not /repos/...)
+	query := fmt.Sprintf("repo:%s/%s in:title %q type:issue state:open", c.Owner, c.Repo, title)
+	urlStr := fmt.Sprintf("%s/search/issues?q=%s", c.BaseURL, net_url.QueryEscape(query))
+
+	respBody, _, err := c.doRequest(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search issues: %w", err)
+	}
+
+	var result struct {
+		Items []Issue `json:"items"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse search response: %w", err)
+	}
+
+	// Filter to exact title match (GitHub search can return partial matches).
+	var exact []Issue
+	for _, issue := range result.Items {
+		if issue.Title == title {
+			exact = append(exact, issue)
+		}
+	}
+	return exact, nil
 }
 
 // GetAuthenticatedUser returns the authenticated user's information.
