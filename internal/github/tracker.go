@@ -128,6 +128,16 @@ func (t *Tracker) FetchIssue(ctx context.Context, identifier string) (*tracker.T
 }
 
 func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker.TrackerIssue, error) {
+	// Idempotency guard: check for an existing open issue with this title before creating.
+	// This prevents duplicates when external_ref was not saved after a previous create
+	// (e.g. due to a race condition or transient write failure).
+	existing, err := t.client.SearchOpenIssuesByTitle(ctx, issue.Title)
+	if err == nil && len(existing) > 0 {
+		// Return the first match — the caller will save this as external_ref.
+		ti := githubToTrackerIssue(&existing[0])
+		return &ti, nil
+	}
+
 	fields := BeadsIssueToGitHubFields(issue, t.config)
 	labels, _ := fields["labels"].([]string)
 
