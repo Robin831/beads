@@ -69,13 +69,14 @@ var githubReposCmd = &cobra.Command{
 }
 
 var (
-	githubSyncDryRun      bool
-	githubSyncPullOnly    bool
-	githubSyncPushOnly    bool
+	githubSyncDryRun       bool
+	githubSyncPullOnly     bool
+	githubSyncPushOnly     bool
 	githubSyncPushOpenOnly bool
-	githubPreferLocal     bool
-	githubPreferGitHub    bool
-	githubPreferNewer     bool
+	githubSyncCloseOnly    bool
+	githubPreferLocal      bool
+	githubPreferGitHub     bool
+	githubPreferNewer      bool
 )
 
 // GitHubConflictStrategy defines how to resolve conflicts between local and GitHub versions.
@@ -149,6 +150,7 @@ func init() {
 	githubSyncCmd.Flags().BoolVar(&githubSyncPullOnly, "pull-only", false, "Only pull issues from GitHub")
 	githubSyncCmd.Flags().BoolVar(&githubSyncPushOnly, "push-only", false, "Only push issues to GitHub")
 	githubSyncCmd.Flags().BoolVar(&githubSyncPushOpenOnly, "push-open-only", false, "Only push open/in-progress beads to GitHub (skip closed)")
+	githubSyncCmd.Flags().BoolVar(&githubSyncCloseOnly, "close-only", false, "Close local beads whose linked GitHub issues are closed (never creates new beads)")
 
 	// Conflict resolution flags (mutually exclusive)
 	githubSyncCmd.Flags().BoolVar(&githubPreferLocal, "prefer-local", false, "On conflict, keep local beads version")
@@ -381,13 +383,14 @@ func runGitHubSync(cmd *cobra.Command, args []string) error {
 	}
 
 	// Build sync options from CLI flags
-	pull := !githubSyncPushOnly
-	push := !githubSyncPullOnly
+	pull := !githubSyncPushOnly && !githubSyncCloseOnly
+	push := !githubSyncPullOnly && !githubSyncCloseOnly
 
 	opts := tracker.SyncOptions{
-		Pull:   pull,
-		Push:   push,
-		DryRun: githubSyncDryRun,
+		Pull:      pull,
+		Push:      push,
+		CloseOnly: githubSyncCloseOnly,
+		DryRun:    githubSyncDryRun,
 	}
 	if githubSyncPushOpenOnly {
 		opts.State = "open"

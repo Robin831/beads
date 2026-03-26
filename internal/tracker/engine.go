@@ -108,7 +108,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	now := time.Now().UTC()
 
 	// Default to bidirectional if neither specified
-	if !opts.Pull && !opts.Push {
+	if !opts.Pull && !opts.Push && !opts.CloseOnly {
 		opts.Pull = true
 		opts.Push = true
 	}
@@ -116,6 +116,22 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	// Track IDs to skip/force during push based on conflict resolution
 	skipPushIDs := make(map[string]bool)
 	forcePushIDs := make(map[string]bool)
+
+	// Phase 0: Close-only mode — close local beads whose GitHub issues are closed.
+	// Does NOT create new beads. Safe to run after every 'git pull'.
+	if opts.CloseOnly {
+		closeStats, err := e.doCloseOnly(ctx, opts)
+		if err != nil {
+			result.Success = false
+			result.Error = fmt.Sprintf("close-only sync failed: %v", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, result.Error)
+			return result, err
+		}
+		result.Stats.Updated += closeStats.Updated
+		result.Stats.Skipped += closeStats.Skipped
+		return result, nil
+	}
 
 	// Phase 1: Pull
 	if opts.Pull {
@@ -380,6 +396,72 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions) (*PullStats, erro
 	span.SetAttributes(
 		attribute.Int("sync.created", stats.Created),
 		attribute.Int("sync.updated", stats.Updated),
+		attribute.Int("sync.skipped", stats.Skipped),
+	)
+	return stats, nil
+}
+
+// doCloseOnly closes local beads whose linked external issues are now closed.
+// Unlike doPull, it never creates new beads — safe to run after every git pull.
+func (e *Engine) doCloseOnly(ctx context.Context, opts SyncOptions) (*PullStats, error) {
+	ctx, span := syncTracer.Start(ctx, "tracker.close_only",
+		trace.WithAttributes(
+			attribute.String("sync.tracker", e.Tracker.DisplayName()),
+			attribute.Bool("sync.dry_run", opts.DryRun),
+		),
+	)
+	defer span.End()
+
+	stats := &PullStats{}
+
+	// Fetch only closed issues from the external tracker.
+	extIssues, err := e.Tracker.FetchIssues(ctx, FetchOptions{State: "closed"})
+	if err != nil {
+		return nil, fmt.Errorf("fetching closed issues: %w", err)
+	}
+
+	e.msg("Fetched %d closed issues from %s", len(extIssues), e.Tracker.DisplayName())
+
+	for _, extIssue := range extIssues {
+		ref := e.Tracker.BuildExternalRef(&extIssue)
+		existing, _ := e.Store.GetIssueByExternalRef(ctx, ref)
+		if existing == nil {
+			// No local bead for this external issue — skip, don't create.
+			stats.Skipped++
+			continue
+		}
+
+		if existing.Status == types.StatusClosed {
+			// Already closed locally.
+			stats.Skipped++
+			continue
+		}
+
+		if opts.DryRun {
+			e.msg("[dry-run] Would close: %s (linked to %s)", existing.ID, extIssue.Identifier)
+			stats.Updated++
+			continue
+		}
+
+		updates := map[string]interface{}{
+			"status":       string(types.StatusClosed),
+			"completed_at": extIssue.CompletedAt,
+		}
+		if existing.CloseReason == "" {
+			reason := "Closed via linked external issue " + extIssue.Identifier
+			updates["close_reason"] = reason
+		}
+
+		if err := e.Store.UpdateIssue(ctx, existing.ID, updates, e.Actor); err != nil {
+			e.warn("Failed to close %s: %v", existing.ID, err)
+			continue
+		}
+		e.msg("Closed bead %s (linked to %s)", existing.ID, extIssue.Identifier)
+		stats.Updated++
+	}
+
+	span.SetAttributes(
+		attribute.Int("sync.closed", stats.Updated),
 		attribute.Int("sync.skipped", stats.Skipped),
 	)
 	return stats, nil
