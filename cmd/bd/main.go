@@ -729,9 +729,12 @@ var rootCmd = &cobra.Command{
 
 		// Auto GitHub sync: push the changed issue to GitHub if enabled.
 		// Runs after backup so external_ref writes from auto-sync are included.
-		if commandDidWrite.Load() {
-			maybeAutoGitHubSync(rootCtx, GetLastTouchedID())
-		}
+		// Note: we don't gate on commandDidWrite because that flag is only set by
+		// backup/gc/purge, not by create/update/close. The issueID check inside
+		// maybeAutoGitHubSync (via GetLastTouchedID) serves as the real guard —
+		// SetLastTouchedID is only called by write commands, so read-only commands
+		// naturally produce an empty ID and auto-sync is skipped.
+		maybeAutoGitHubSync(rootCtx, GetLastTouchedID())
 
 		// Auto-push: push to Dolt remote if enabled and due.
 		// Skip for read-only commands to avoid unnecessary network operations
