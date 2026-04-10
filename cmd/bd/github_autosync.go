@@ -6,7 +6,7 @@ import (
 	"os"
 
 	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/tracker"
+	"github.com/steveyegge/beads/internal/github"
 )
 
 // maybeAutoGitHubSync pushes a single changed issue to GitHub if auto-sync is enabled.
@@ -41,14 +41,53 @@ func maybeAutoGitHubSync(ctx context.Context, issueID string) {
 		return
 	}
 
-	engine, err := buildGitHubEngine(ctx, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: github autosync init failed: %v\n", err)
-		return
-	}
-
-	opts := tracker.SyncOptions{Push: true, IssueIDs: []string{issueID}}
-	if _, err := engine.Sync(ctx, opts); err != nil {
+	if err := pushSingleIssueToGitHub(ctx, issueID); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: github autosync failed for %s: %v\n", issueID, err)
 	}
 }
+
+// pushSingleIssueToGitHub creates or updates exactly one bead in GitHub without
+// performing any bulk list/search operations. It fetches the issue directly by ID,
+// then calls CreateIssue or UpdateIssue on the GitHub tracker as needed.
+func pushSingleIssueToGitHub(ctx context.Context, issueID string) error {
+	issue, err := store.GetIssue(ctx, issueID)
+	if err != nil {
+		return fmt.Errorf("fetching issue %s: %w", issueID, err)
+	}
+	if issue == nil {
+		return fmt.Errorf("issue %s not found", issueID)
+	}
+
+	gt := &github.Tracker{}
+	if err := gt.Init(ctx, store); err != nil {
+		return fmt.Errorf("initializing GitHub tracker: %w", err)
+	}
+
+	extRef := ""
+	if issue.ExternalRef != nil {
+		extRef = *issue.ExternalRef
+	}
+
+	if extRef == "" || !gt.IsExternalRef(extRef) {
+		// No external ref yet — create a new GitHub issue.
+		created, err := gt.CreateIssue(ctx, issue)
+		if err != nil {
+			return fmt.Errorf("creating GitHub issue for %s: %w", issueID, err)
+		}
+		ref := gt.BuildExternalRef(created)
+		if err := store.UpdateIssue(ctx, issueID, map[string]interface{}{"external_ref": ref}, actor); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: github autosync: failed to save external_ref for %s: %v\n", issueID, err)
+		}
+	} else {
+		// Already has a GitHub reference — update the existing issue.
+		extID := gt.ExtractIdentifier(extRef)
+		if extID == "" {
+			return fmt.Errorf("could not extract GitHub issue number from %q", extRef)
+		}
+		if _, err := gt.UpdateIssue(ctx, extID, issue); err != nil {
+			return fmt.Errorf("updating GitHub issue for %s: %w", issueID, err)
+		}
+	}
+	return nil
+}
+
