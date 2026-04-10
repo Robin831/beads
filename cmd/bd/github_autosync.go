@@ -34,8 +34,10 @@ func maybeAutoGitHubSync(ctx context.Context, issueID string) {
 
 	ghConfig := getGitHubConfig()
 	if err := validateGitHubConfig(ghConfig); err != nil {
-		// Not configured — silently skip, don't spam stderr on every command.
-		debug.Logf("github autosync: not configured (%v)\n", err)
+		// Token or owner/repo not configured — warn so users know why sync was skipped.
+		// Most common cause: github.token only set as env var, not via 'bd config set'.
+		fmt.Fprintf(os.Stderr, "Warning: github autosync skipped (not configured): %v\n", err)
+		fmt.Fprintf(os.Stderr, "  Run: bd config set github.token <your-token>\n")
 		return
 	}
 
