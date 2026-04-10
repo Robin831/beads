@@ -47,8 +47,8 @@ func maybeAutoGitHubSync(ctx context.Context, issueID string) {
 		return
 	}
 
-	opts := tracker.SyncOptions{Push: true}
-	if err := engine.SyncOne(ctx, issueID, opts); err != nil {
+	opts := tracker.SyncOptions{Push: true, IssueIDs: []string{issueID}}
+	if _, err := engine.Sync(ctx, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: github autosync failed for %s: %v\n", issueID, err)
 	}
 }
