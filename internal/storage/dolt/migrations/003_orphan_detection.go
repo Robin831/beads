@@ -15,6 +15,14 @@ import (
 // This migration is non-destructive: it only logs orphans for the user to
 // review. Users can then decide to delete orphans or convert them to
 // top-level issues using 'bd doctor --fix'.
+//
+// NOTE: This function is no longer wired into compatMigrationsList — see
+// internal/storage/dolt/migrations.go for the reason. It is kept here (and
+// still covered by tests) so it can be reused from `bd doctor` if desired.
+// Known limitation: the dotted-ID heuristic produces false positives for
+// issue prefixes that themselves contain a dot (e.g. "Fhi.Metadata-abcd"),
+// because SUBSTRING_INDEX treats the prefix separator as a parent-child
+// separator.
 func DetectOrphanedChildren(db *sql.DB) error {
 	// Find child issues (IDs containing a dot) whose parent doesn't exist.
 	// SUBSTRING_INDEX(id, '.', -1) gives the last segment after the final dot.

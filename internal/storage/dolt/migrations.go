@@ -23,7 +23,14 @@ type CompatMigration struct {
 var compatMigrationsList = []CompatMigration{
 	{"wisp_type_column", migrations.MigrateWispTypeColumn},
 	{"spec_id_column", migrations.MigrateSpecIDColumn},
-	{"orphan_detection", migrations.DetectOrphanedChildren},
+	// orphan_detection intentionally omitted: it is a diagnostic, not a
+	// schema transform, and running it on every write-mode Open spams the
+	// log with ~1 line per orphan every time. It is also broken for issue
+	// prefixes that contain a dot (e.g. "Fhi.Metadata-abcd") — the query
+	// uses SUBSTRING_INDEX(id, '.', -1) which treats the prefix separator
+	// as a parent-child separator, flagging every such issue as an orphan.
+	// Orphan detection is already covered by `bd doctor --deep`, which is
+	// the right place for user-facing diagnostics.
 	{"wisps_table", migrations.MigrateWispsTable},
 	{"wisp_auxiliary_tables", migrations.MigrateWispAuxiliaryTables},
 	{"issue_counter_table", migrations.MigrateIssueCounterTable},
