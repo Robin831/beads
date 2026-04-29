@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -164,7 +165,11 @@ func maybeAutoPush(ctx context.Context) {
 	defer pushCancel()
 
 	debug.Logf("dolt auto-push: pushing to origin (timeout %s)...\n", pushTimeout)
-	if err := pushWithContext(pushCtx, st); err != nil {
+	pushErr := tryRemoteCLIPushPull(pushCtx, "push", "origin", "")
+	if errors.Is(pushErr, errRemoteCLINotApplicable) {
+		pushErr = pushWithContext(pushCtx, st)
+	}
+	if err := pushErr; err != nil {
 		if !isQuiet() && !jsonOutput {
 			if pushCtx.Err() == context.DeadlineExceeded {
 				fmt.Fprintf(os.Stderr, "Warning: dolt auto-push timed out after %s (remote may be unreachable)\n", pushTimeout)

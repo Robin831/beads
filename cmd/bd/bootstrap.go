@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -734,11 +735,34 @@ func resolveRemoteCloneMode(beadsDir string, cfg *configfile.Config, cloneMode r
 }
 
 // cloneViaEmbedded clones using the embedded Dolt engine (CGO required).
+//
+// When DOLT_REMOTE_USER is set, the clone is routed through the `dolt` CLI
+// instead of the embedded engine's SQL `CALL DOLT_CLONE`. The reason: the
+// stored procedure has no user-selection parameter and the embedded engine's
+// gRPC client falls back to a non-credentialed identity that doesn't pick
+// up DOLT_REMOTE_PASSWORD. The CLI accepts --user, which authenticates
+// correctly against a remotesapi that requires username/password.
+// The CLI clones into the same on-disk layout the embedded engine expects
+// (dataDir/<dbName>/.dolt/), so subsequent embedded reads see the database.
 func cloneViaEmbedded(ctx context.Context, beadsDir, remoteURL, dbName string) error {
 	dataDir := filepath.Join(beadsDir, "embeddeddolt")
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return fmt.Errorf("create embeddeddolt directory: %w", err)
 	}
+
+	if user := strings.TrimSpace(os.Getenv("DOLT_REMOTE_USER")); user != "" {
+		cloneTarget := filepath.Join(dataDir, dbName)
+		args := []string{"clone", "--user=" + user, remoteURL, cloneTarget}
+		cmd := exec.CommandContext(ctx, "dolt", args...)
+		// Inherit env (DOLT_REMOTE_PASSWORD propagates from process env).
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("dolt clone failed: %w\nOutput: %s", err, out)
+		}
+		fmt.Fprintf(os.Stderr, "Synced database from %s (via dolt CLI)\n", remoteURL)
+		return nil
+	}
+
 	db, cleanup, err := embeddeddolt.OpenSQL(ctx, dataDir, "", "")
 	if err != nil {
 		return fmt.Errorf("open embedded engine for clone: %w", err)

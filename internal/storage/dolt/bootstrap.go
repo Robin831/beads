@@ -71,7 +71,16 @@ func BootstrapFromRemoteWithDB(ctx context.Context, doltDir, remoteURL, database
 	// Clone into <doltDir>/<database>/ so the embedded driver can find it.
 	// `dolt clone <url> <target>` creates <target>/.dolt/ directly.
 	cloneTarget := filepath.Join(doltDir, database)
-	cmd := exec.CommandContext(ctx, "dolt", "clone", remoteURL, cloneTarget)
+	args := []string{"clone"}
+	// Pass --user when DOLT_REMOTE_USER is set so DOLT_REMOTE_PASSWORD takes
+	// effect. Without --user, dolt clone falls back to a user that does not
+	// honor the remote-password env var, which produces an
+	// "Access denied for user 'root'" error against authenticated remotes.
+	if user := strings.TrimSpace(os.Getenv("DOLT_REMOTE_USER")); user != "" {
+		args = append(args, "--user="+user)
+	}
+	args = append(args, remoteURL, cloneTarget)
+	cmd := exec.CommandContext(ctx, "dolt", args...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return false, fmt.Errorf("dolt clone failed: %w\nOutput: %s", err, output)
 	}

@@ -246,7 +246,13 @@ The remote must already exist (see 'bd dolt remote add').`,
 		if force {
 			pushErr = st.ForcePush(ctx)
 		} else {
-			pushErr = st.Push(ctx)
+			// Try CLI fallback first when DOLT_REMOTE_USER is set — the
+			// embedded engine's CALL DOLT_PUSH ignores DOLT_REMOTE_USER and
+			// fails on remotesapi servers that require user/password auth.
+			pushErr = tryRemoteCLIPushPull(ctx, "push", "origin", "")
+			if errors.Is(pushErr, errRemoteCLINotApplicable) {
+				pushErr = st.Push(ctx)
+			}
 		}
 		if pushErr != nil {
 			if isRemoteNotFoundErr(pushErr) {
@@ -303,7 +309,13 @@ The remote must already exist (see 'bd dolt remote add').`,
 			return
 		}
 		fmt.Println("Pulling from Dolt remote...")
-		if err := st.Pull(ctx); err != nil {
+		// Try CLI fallback first when DOLT_REMOTE_USER is set — same auth
+		// reason as bd dolt push above.
+		pullErr := tryRemoteCLIPushPull(ctx, "pull", "origin", "")
+		if errors.Is(pullErr, errRemoteCLINotApplicable) {
+			pullErr = st.Pull(ctx)
+		}
+		if err := pullErr; err != nil {
 			if isRemoteNotFoundErr(err) {
 				printNoRemoteGuidance()
 				return
