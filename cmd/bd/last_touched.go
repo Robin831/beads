@@ -61,6 +61,23 @@ func SetLastTouchedID(issueID string) {
 	_ = os.WriteFile(lastTouchedPath, []byte(issueID+"\n"), 0600)
 }
 
+// RecordViewedID writes the persistent last-touched file but does NOT
+// update the in-process sync trigger. Use from read-only commands like
+// `bd show` so subsequent `bd update`/`bd close` without an ID can resolve
+// to this issue, without firing GitHub auto-sync (which keys off
+// GetLastTouchedIDThisRun).
+func RecordViewedID(issueID string) {
+	if issueID == "" {
+		return
+	}
+	beadsDir := beads.FindBeadsDir()
+	if beadsDir == "" {
+		return
+	}
+	lastTouchedPath := filepath.Join(beadsDir, lastTouchedFile)
+	_ = os.WriteFile(lastTouchedPath, []byte(issueID+"\n"), 0600)
+}
+
 // ClearLastTouched removes the last touched file.
 // Silently ignores errors.
 func ClearLastTouched() {

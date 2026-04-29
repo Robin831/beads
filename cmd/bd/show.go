@@ -382,9 +382,11 @@ var showCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		// Track first shown issue as last touched
+		// Track first shown issue as last touched (persistent file only, no
+		// in-process sync trigger — bd show is read-only and should not fire
+		// GitHub auto-sync).
 		if len(args) > 0 {
-			SetLastTouchedID(args[0])
+			RecordViewedID(args[0])
 		}
 	},
 }
