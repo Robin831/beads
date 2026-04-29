@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -78,7 +79,11 @@ func maybeAutoExport(ctx context.Context) {
 	// Determine output path
 	exportPath := config.GetString("export.path")
 	if exportPath == "" {
-		exportPath = "export.jsonl"
+		if globalFlag {
+			exportPath = "global-issues.jsonl"
+		} else {
+			exportPath = "issues.jsonl"
+		}
 	}
 	fullPath := filepath.Join(beadsDir, exportPath)
 
@@ -92,8 +97,19 @@ func maybeAutoExport(ctx context.Context) {
 	debug.Logf("auto-export: wrote %d issues and %d memories to %s\n",
 		issueCount, memoryCount, fullPath)
 
-	// Optional git add
-	if config.GetBool("export.git-add") {
+	// Don't prime the throttle on an empty export (e.g. immediately after
+	// `bd init`). Saving state here would block the first real `bd create`
+	// from exporting for up to export.interval seconds even though the data
+	// has changed. Remove the empty file too so users don't see a stale 0-byte
+	// issues.jsonl before any issues exist.
+	if issueCount == 0 && memoryCount == 0 {
+		_ = os.Remove(fullPath)
+		return
+	}
+
+	// Optional git add — skip when no-git-ops is set (GH#3314), when not in a
+	// git repo (standalone BEADS_DIR flow), or when export.git-add is false.
+	if config.GetBool("export.git-add") && !config.GetBool("no-git-ops") && isGitRepo() {
 		if err := gitAddFile(fullPath); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: auto-export: git add failed: %v\n", err)
 		}
@@ -138,19 +154,11 @@ func exportToFile(ctx context.Context, path string, includeMemories bool) (issue
 	isTemplate := false
 	filter.IsTemplate = &isTemplate
 
-	// Fetch issues
+	// Fetch all issues (persistent + wisps). SearchIssues with Ephemeral=nil
+	// already includes wisps via ID-based dedup (GH#3352).
 	issues, err := store.SearchIssues(ctx, "", filter)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to search issues: %w", err)
-	}
-
-	// Also fetch wisps
-	ephemeral := true
-	wispFilter := filter
-	wispFilter.Ephemeral = &ephemeral
-	wispIssues, err := store.SearchIssues(ctx, "", wispFilter)
-	if err == nil && len(wispIssues) > 0 {
-		issues = append(issues, wispIssues...)
 	}
 
 	// Bulk-load relational data
@@ -179,11 +187,14 @@ func exportToFile(ctx context.Context, path string, includeMemories bool) (issue
 				counts = &types.DependencyCounts{}
 			}
 			sanitizeZeroTime(issue)
-			record := &types.IssueWithCounts{
-				Issue:           issue,
-				DependencyCount: counts.DependencyCount,
-				DependentCount:  counts.DependentCount,
-				CommentCount:    commentCounts[issue.ID],
+			record := &exportIssueRecord{
+				RecordType: "issue",
+				IssueWithCounts: &types.IssueWithCounts{
+					Issue:           issue,
+					DependencyCount: counts.DependencyCount,
+					DependentCount:  counts.DependentCount,
+					CommentCount:    commentCounts[issue.ID],
+				},
 			}
 			if err := enc.Encode(record); err != nil {
 				return 0, 0, fmt.Errorf("failed to write issue %s: %w", issue.ID, err)
@@ -197,10 +208,16 @@ func exportToFile(ctx context.Context, path string, includeMemories bool) (issue
 		allConfig, err := store.GetAllConfig(ctx)
 		if err == nil {
 			fullPrefix := kvPrefix + memoryPrefix
-			for k, v := range allConfig {
-				if !strings.HasPrefix(k, fullPrefix) {
-					continue
+			// Sort keys for deterministic output order (GH#3474).
+			var memKeys []string
+			for k := range allConfig {
+				if strings.HasPrefix(k, fullPrefix) {
+					memKeys = append(memKeys, k)
 				}
+			}
+			sort.Strings(memKeys)
+			for _, k := range memKeys {
+				v := allConfig[k]
 				userKey := strings.TrimPrefix(k, fullPrefix)
 				record := map[string]string{
 					"_type": "memory",
@@ -209,7 +226,7 @@ func exportToFile(ctx context.Context, path string, includeMemories bool) (issue
 				}
 				data, err := json.Marshal(record)
 				if err != nil {
-					continue
+					return issueCount, memoryCount, fmt.Errorf("failed to marshal memory %s: %w", userKey, err)
 				}
 				if _, err := f.Write(data); err != nil {
 					return issueCount, memoryCount, fmt.Errorf("failed to write memory: %w", err)
@@ -254,9 +271,147 @@ func saveExportAutoState(beadsDir string, state *exportAutoState) {
 	}
 }
 
-// gitAddFile stages a file in the enclosing git repo.
+// gitAddFile stages a file in the enclosing git repo. When called from
+// inside a git hook, it scrubs inherited GIT_* env vars (so git
+// rediscovers the repo from cwd rather than treating cmd.Dir as the
+// worktree root) and skips staging when the target is outside the hook's
+// worktree (the .beads/redirect case, where staging would pollute the
+// main repo's index). See GH#3311, scrubGitHookEnv, hookWorkTreeRoot.
 func gitAddFile(path string) error {
+	if wt := hookWorkTreeRoot(); wt != "" && !pathInsideDir(path, wt) {
+		// Running inside a hook AND target is outside the hook's worktree.
+		// Staging here would pollute a different repo's index; skip.
+		return nil
+	}
 	cmd := exec.Command("git", "add", path)
 	cmd.Dir = filepath.Dir(path)
-	return cmd.Run()
+	cmd.Env = scrubGitHookEnv(os.Environ())
+	// Capture combined output so the caller's warning surfaces git's stderr
+	// (e.g. "paths are ignored", "Unable to create index.lock") instead of
+	// just the exit-status text.
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+			return fmt.Errorf("%w: %s", err, trimmed)
+		}
+		return err
+	}
+	return nil
+}
+
+// scrubGitHookEnv returns env with the GIT_* variables that can poison
+// git's repo/worktree auto-discovery or object-store resolution removed,
+// so git falls back to auto-discovery from cwd. The scrub is
+// unconditional: if a user has intentionally exported any of these vars
+// for scripting purposes, they will be stripped from the git-add child
+// process. That is the correct trade-off here; we never want beads'
+// auto-stage to honor a GIT_DIR pointing at an unrelated repo.
+//
+// Covered vars:
+//   - Repo/worktree discovery: GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR,
+//     GIT_PREFIX, GIT_CEILING_DIRECTORIES, GIT_DISCOVERY_ACROSS_FILESYSTEM
+//   - Index routing: GIT_INDEX_FILE
+//   - Object routing: GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES
+//   - Config injection (any GIT_CONFIG* — e.g. GIT_CONFIG_PARAMETERS set
+//     when the parent ran `git -c core.worktree=… commit`): the whole
+//     GIT_CONFIG namespace, which includes _COUNT, _KEY_n, _VALUE_n,
+//     _GLOBAL, _SYSTEM, _NOSYSTEM, and the legacy GIT_CONFIG itself.
+func scrubGitHookEnv(env []string) []string {
+	// The GIT_CONFIG prefix (no trailing "=") is intentional: it matches
+	// GIT_CONFIG=, GIT_CONFIG_COUNT=, GIT_CONFIG_KEY_n=, GIT_CONFIG_VALUE_n=,
+	// GIT_CONFIG_PARAMETERS=, GIT_CONFIG_GLOBAL=, GIT_CONFIG_SYSTEM=, and
+	// GIT_CONFIG_NOSYSTEM= — the whole family — in one entry. No standard
+	// git env var starts with GIT_CONFIG that we want to preserve.
+	prefixes := []string{
+		"GIT_DIR=",
+		"GIT_WORK_TREE=",
+		"GIT_INDEX_FILE=",
+		"GIT_COMMON_DIR=",
+		"GIT_PREFIX=",
+		"GIT_OBJECT_DIRECTORY=",
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES=",
+		"GIT_CEILING_DIRECTORIES=",
+		"GIT_DISCOVERY_ACROSS_FILESYSTEM=",
+		"GIT_CONFIG",
+	}
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		skip := false
+		for _, p := range prefixes {
+			if strings.HasPrefix(e, p) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// hookWorkTreeRoot returns the root of the worktree whose git hook we
+// are running inside, based on the inherited GIT_DIR env var. Returns ""
+// when GIT_DIR is not set (the normal non-hook case) or cannot be
+// resolved to a work-tree.
+//
+// Resolution rules:
+//   - In a linked worktree, GIT_DIR points at main/.git/worktrees/<name>
+//     and that directory contains a "gitdir" file whose contents are the
+//     absolute path to the worktree's .git FILE. The worktree root is
+//     the parent of that .git file.
+//   - In a non-worktree, GIT_DIR is typically ".git" or "<repo>/.git";
+//     the worktree root is its parent.
+func hookWorkTreeRoot() string {
+	gitDir := os.Getenv("GIT_DIR")
+	if gitDir == "" {
+		return ""
+	}
+	var root string
+	if data, err := os.ReadFile(filepath.Join(gitDir, "gitdir")); err == nil { // #nosec G304 -- path is GIT_DIR/gitdir, a well-known git internal file
+		if dotGit := strings.TrimSpace(string(data)); dotGit != "" {
+			root = filepath.Dir(dotGit)
+		}
+	}
+	if root == "" && filepath.Base(gitDir) == ".git" {
+		root = filepath.Dir(gitDir)
+	}
+	if root == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return ""
+	}
+	return abs
+}
+
+// pathInsideDir reports whether path is the same as dir or a descendant
+// of dir, after resolving symlinks on both sides. Returns false on any
+// resolution error (conservative: when in doubt, treat as outside).
+//
+// Resolves the PARENT of path rather than path itself, which handles the
+// common "target file does not yet exist" case: on macOS /tmp is a
+// symlink to /private/tmp, so asymmetric EvalSymlinks on a nonexistent
+// file vs its existing parent would otherwise produce a spurious false.
+// Callers (gitAddFile) always pass a path whose parent exists (either
+// beadsDir, which FindBeadsDir verified, or a directory just created by
+// the export write), so this single-level resolution is sufficient.
+func pathInsideDir(path, dir string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	if r, err := filepath.EvalSymlinks(filepath.Dir(absPath)); err == nil {
+		absPath = filepath.Join(r, filepath.Base(absPath))
+	}
+	if r, err := filepath.EvalSymlinks(absDir); err == nil {
+		absDir = r
+	}
+	sep := string(filepath.Separator)
+	return absPath == absDir || strings.HasPrefix(absPath, absDir+sep)
 }

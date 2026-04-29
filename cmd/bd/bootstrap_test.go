@@ -10,11 +10,37 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 )
 
+func snapshotBootstrapEnv(t *testing.T) func() {
+	t.Helper()
+	saved := make(map[string]string)
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, "BD_") || strings.HasPrefix(env, "BEADS_") {
+			parts := strings.SplitN(env, "=", 2)
+			key := parts[0]
+			saved[key] = os.Getenv(key)
+			_ = os.Unsetenv(key)
+		}
+	}
+	return func() {
+		for _, env := range os.Environ() {
+			if strings.HasPrefix(env, "BD_") || strings.HasPrefix(env, "BEADS_") {
+				parts := strings.SplitN(env, "=", 2)
+				_ = os.Unsetenv(parts[0])
+			}
+		}
+		for key, val := range saved {
+			_ = os.Setenv(key, val)
+		}
+	}
+}
+
 func TestDetectBootstrapAction_NoneWhenDatabaseExists(t *testing.T) {
 	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
 	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
@@ -118,6 +144,20 @@ func TestDetectBootstrapAction_InitWhenNothingExists(t *testing.T) {
 	}
 }
 
+func TestNoWorkspaceBootstrapPayload(t *testing.T) {
+	payload := noWorkspaceBootstrapPayload()
+
+	if got := payload["action"]; got != "none" {
+		t.Fatalf("action = %v, want %q", got, "none")
+	}
+	if got := payload["reason"]; got != activeWorkspaceNotFoundError() {
+		t.Fatalf("reason = %v, want %q", got, activeWorkspaceNotFoundError())
+	}
+	if got := payload["suggestion"]; got != diagHint() {
+		t.Fatalf("suggestion = %v, want %q", got, diagHint())
+	}
+}
+
 func TestDetectBootstrapAction_ServerModeMissingConfiguredDBDoesNotReturnNone(t *testing.T) {
 	t.Setenv("BEADS_DOLT_DATA_DIR", "")
 	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
@@ -175,6 +215,7 @@ func TestDetectBootstrapAction_ServerModeMissingConfiguredDBDoesNotReturnNone(t 
 
 func TestDetectBootstrapAction_ServerModeProbeErrorStopsWithReason(t *testing.T) {
 	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
 	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
@@ -252,7 +293,7 @@ func TestDetectBootstrapAction_SyncWhenOriginHasDoltRef(t *testing.T) {
 	runGitForBootstrapTest(t, sourceDir, "config", "user.name", "Test User")
 	runGitForBootstrapTest(t, sourceDir, "commit", "--allow-empty", "-m", "init")
 	runGitForBootstrapTest(t, sourceDir, "remote", "add", "origin", bareDir)
-	runGitForBootstrapTest(t, sourceDir, "push", "origin", "main")
+	runGitForBootstrapTest(t, sourceDir, "push", "origin", "HEAD:refs/dolt/data")
 	// Create refs/dolt/data by pushing HEAD to that ref
 	runGitForBootstrapTest(t, sourceDir, "push", "origin", "HEAD:refs/dolt/data")
 
@@ -283,6 +324,47 @@ func TestDetectBootstrapAction_SyncWhenOriginHasDoltRef(t *testing.T) {
 	}
 	if plan.SyncRemote == "" {
 		t.Error("SyncRemote is empty, expected git+ prefixed URL")
+	}
+}
+
+func TestDetectBootstrapAction_ExplicitSyncRemotePreservesRemotesAPIURL(t *testing.T) {
+	restore := snapshotBootstrapEnv(t)
+	defer restore()
+	config.ResetForTesting()
+	defer config.ResetForTesting()
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	const syncRemote = "http://myserver:7007/mydb"
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("sync.remote: "+syncRemote+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+	t.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
+	if err := config.Initialize(); err != nil {
+		t.Fatalf("config.Initialize failed: %v", err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := configfile.DefaultConfig()
+	plan := detectBootstrapAction(beadsDir, cfg)
+
+	if plan.Action != "sync" {
+		t.Errorf("action = %q, want %q", plan.Action, "sync")
+	}
+	if plan.SyncRemote != syncRemote {
+		t.Errorf("SyncRemote = %q, want unnormalized explicit sync.remote %q", plan.SyncRemote, syncRemote)
 	}
 }
 
@@ -349,7 +431,7 @@ func TestBootstrapFreshCloneDetectsRemote(t *testing.T) {
 	runGitForBootstrapTest(t, sourceDir, "config", "user.name", "Test User")
 	runGitForBootstrapTest(t, sourceDir, "commit", "--allow-empty", "-m", "init")
 	runGitForBootstrapTest(t, sourceDir, "remote", "add", "origin", bareDir)
-	runGitForBootstrapTest(t, sourceDir, "push", "origin", "main")
+	runGitForBootstrapTest(t, sourceDir, "push", "origin", "HEAD:refs/dolt/data")
 	runGitForBootstrapTest(t, sourceDir, "push", "origin", "HEAD:refs/dolt/data")
 
 	// Clone into a fresh directory — no .beads exists.
@@ -379,11 +461,11 @@ func TestBootstrapFreshCloneDetectsRemote(t *testing.T) {
 	if !isGitRepo() {
 		t.Fatal("expected to be in a git repo")
 	}
-	originURL, err := gitRemoteGetURL("origin")
+	originURL, err := gitOriginGetURL()
 	if err != nil || originURL == "" {
 		t.Fatalf("expected origin URL, got err=%v url=%q", err, originURL)
 	}
-	if !gitLsRemoteHasRef("origin", "refs/dolt/data") {
+	if !gitOriginHasDoltDataRef() {
 		t.Fatal("expected origin to have refs/dolt/data")
 	}
 
@@ -433,7 +515,7 @@ func TestBootstrapFreshCloneNoRemoteData(t *testing.T) {
 	if !isGitRepo() {
 		t.Fatal("expected to be in a git repo")
 	}
-	if gitLsRemoteHasRef("origin", "refs/dolt/data") {
+	if gitOriginHasDoltDataRef() {
 		t.Fatal("origin should NOT have refs/dolt/data")
 	}
 
@@ -742,7 +824,7 @@ func TestBootstrapFreshCloneSynthesizedDirUsesDefaultDB(t *testing.T) {
 	runGitForBootstrapTest(t, sourceDir, "config", "user.name", "Test User")
 	runGitForBootstrapTest(t, sourceDir, "commit", "--allow-empty", "-m", "init")
 	runGitForBootstrapTest(t, sourceDir, "remote", "add", "origin", bareDir)
-	runGitForBootstrapTest(t, sourceDir, "push", "origin", "main")
+	runGitForBootstrapTest(t, sourceDir, "push", "origin", "HEAD:refs/dolt/data")
 	runGitForBootstrapTest(t, sourceDir, "push", "origin", "HEAD:refs/dolt/data")
 
 	// Clone — no .beads dir
@@ -824,7 +906,7 @@ func TestBootstrapRigSubdirUsesParentDBName(t *testing.T) {
 	runGitForBootstrapTest(t, rigDir, "config", "user.name", "Test User")
 	runGitForBootstrapTest(t, rigDir, "commit", "--allow-empty", "-m", "init")
 	runGitForBootstrapTest(t, rigDir, "remote", "add", "origin", bareDir)
-	runGitForBootstrapTest(t, rigDir, "push", "origin", "main")
+	runGitForBootstrapTest(t, rigDir, "push", "origin", "HEAD:refs/dolt/data")
 	runGitForBootstrapTest(t, rigDir, "push", "origin", "HEAD:refs/dolt/data")
 
 	oldWd, err := os.Getwd()
@@ -929,5 +1011,653 @@ func TestDetectBootstrapAction_SharedServerEnvUsesSharedPath(t *testing.T) {
 	}
 	if !plan.HasExisting {
 		t.Error("HasExisting = false, want true")
+	}
+}
+
+// TestDetectBootstrapAction_WorktreeSynthesizedDirPrefersSyncOverDefaultSharedDB
+// verifies that when bootstrap is running from a worktree whose fallback
+// .beads path lives under a bare/common git directory, remote recovery via
+// refs/dolt/data wins over an unrelated default "beads" database already
+// present on the shared server.
+func TestDetectBootstrapAction_WorktreeSynthesizedDirPrefersSyncOverDefaultSharedDB(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	originBare := filepath.Join(t.TempDir(), "origin.git")
+	runGitForBootstrapTest(t, "", "init", "--bare", "--initial-branch=main", originBare)
+
+	sourceDir := t.TempDir()
+	runGitForBootstrapTest(t, sourceDir, "init", "-b", "main")
+	runGitForBootstrapTest(t, sourceDir, "config", "user.email", "test@test.com")
+	runGitForBootstrapTest(t, sourceDir, "config", "user.name", "Test User")
+	runGitForBootstrapTest(t, sourceDir, "commit", "--allow-empty", "-m", "init")
+	runGitForBootstrapTest(t, sourceDir, "remote", "add", "origin", originBare)
+	runGitForBootstrapTest(t, sourceDir, "push", "origin", "main")
+	runGitForBootstrapTest(t, sourceDir, "push", "origin", "HEAD:refs/dolt/data")
+
+	localBare := filepath.Join(t.TempDir(), "local-bare.git")
+	runGitForBootstrapTest(t, "", "clone", "--bare", originBare, localBare)
+
+	worktreeDir := filepath.Join(t.TempDir(), "worktree")
+	runGitForBootstrapTest(t, "", "--git-dir="+localBare, "worktree", "add", worktreeDir, "main")
+
+	sharedDoltDir := filepath.Join(homeDir, ".beads", "shared-server", "dolt")
+	if err := os.MkdirAll(filepath.Join(sharedDoltDir, "beads"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(worktreeDir); err != nil {
+		t.Fatal(err)
+	}
+
+	synthesizedDir := filepath.Join(localBare, ".beads")
+	cfg, cfgErr := configfile.Load(synthesizedDir)
+	if cfgErr != nil || cfg == nil {
+		cfg = findParentConfig(synthesizedDir)
+	}
+	if cfg == nil {
+		cfg = configfile.DefaultConfig()
+	}
+
+	if got := cfg.GetDoltDatabase(); got != "beads" {
+		t.Fatalf("GetDoltDatabase() = %q, want %q (default expected without local metadata)", got, "beads")
+	}
+
+	origCheck := checkBootstrapServerDB
+	checkBootstrapServerDB = func(probeCfg bootstrapServerProbeConfig) bootstrapServerDBCheck {
+		if probeCfg.database != "beads" {
+			t.Fatalf("probeCfg.database = %q, want %q", probeCfg.database, "beads")
+		}
+		return bootstrapServerDBCheck{Exists: true, Reachable: true}
+	}
+	defer func() { checkBootstrapServerDB = origCheck }()
+
+	plan := detectBootstrapAction(synthesizedDir, cfg)
+
+	if plan.Action != "sync" {
+		t.Fatalf("expected action=%q, got %q: %s", "sync", plan.Action, plan.Reason)
+	}
+	if plan.SyncRemote == "" {
+		t.Fatal("expected SyncRemote to be populated from origin refs/dolt/data detection")
+	}
+	if plan.Database != "beads" {
+		t.Errorf("plan.Database = %q, want %q (default metadata-free value should still recover via sync)", plan.Database, "beads")
+	}
+}
+
+func TestDetectBootstrapAction_SynthesizedDirWithoutRecoveryStillUsesExistingSharedDB(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	worktreeDir := filepath.Join(t.TempDir(), "worktree")
+	if err := os.MkdirAll(worktreeDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(worktreeDir); err != nil {
+		t.Fatal(err)
+	}
+
+	sharedDoltDir := filepath.Join(homeDir, ".beads", "shared-server", "dolt")
+	if err := os.MkdirAll(filepath.Join(sharedDoltDir, "project_existing"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	synthesizedDir := filepath.Join(worktreeDir, ".beads")
+	cfg := configfile.DefaultConfig()
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltDatabase = "project_existing"
+
+	origCheck := checkBootstrapServerDB
+	checkBootstrapServerDB = func(probeCfg bootstrapServerProbeConfig) bootstrapServerDBCheck {
+		if probeCfg.database != "project_existing" {
+			t.Fatalf("probeCfg.database = %q, want %q", probeCfg.database, "project_existing")
+		}
+		return bootstrapServerDBCheck{Exists: true, Reachable: true}
+	}
+	defer func() { checkBootstrapServerDB = origCheck }()
+
+	plan := detectBootstrapAction(synthesizedDir, cfg)
+
+	if plan.Action != "none" {
+		t.Fatalf("expected action=%q, got %q: %s", "none", plan.Action, plan.Reason)
+	}
+	if !plan.HasExisting {
+		t.Fatal("expected HasExisting to be true when configured shared-server DB already exists")
+	}
+}
+
+// TestFinalizeSyncedBootstrapWritesConfigFiles verifies that after a sync
+// clone, finalizeSyncedBootstrap writes the metadata.json and config.yaml
+// files bd needs to reopen the cloned database. This is the regression
+// guard for GH#3201: executeSyncAction previously left the workspace
+// without these files, causing "no beads configuration found" and
+// "Error 1105: no database selected" on every subsequent bd command.
+func TestFinalizeSyncedBootstrapWritesConfigFiles(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a post-clone workspace: cloneFromRemote created the
+	// embeddeddolt directory but no metadata.json / config.yaml exists.
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Point findProjectConfigYaml at the test workspace instead of walking
+	// up from CWD, so the sync.remote write lands in the right file even
+	// when the test runs from an unrelated directory.
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	const dbName = "beads_hq"
+	const syncRemote = "file:///tmp/fake-origin.git"
+
+	cfg := configfile.DefaultConfig()
+	if err := finalizeSyncedBootstrap(beadsDir, syncRemote, cfg, dbName); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	// metadata.json must exist and record the database name bd needs to
+	// reopen the cloned data. Without this, GetDoltDatabase() falls back to
+	// DefaultDoltDatabase ("beads") and the cloned DB is unreachable.
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load after finalize failed: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("configfile.Load returned nil; metadata.json was not written")
+	}
+	if loaded.GetDoltDatabase() != dbName {
+		t.Errorf("dolt_database = %q, want %q", loaded.GetDoltDatabase(), dbName)
+	}
+	if loaded.GetDoltMode() != configfile.DoltModeEmbedded {
+		t.Errorf("dolt_mode = %q, want %q", loaded.GetDoltMode(), configfile.DoltModeEmbedded)
+	}
+	if loaded.GetBackend() != configfile.BackendDolt {
+		t.Errorf("backend = %q, want %q", loaded.GetBackend(), configfile.BackendDolt)
+	}
+
+	// config.yaml must exist so GetYamlConfig / SetYamlConfig and other
+	// yaml-backed settings (sync.remote, dolt.shared-server, etc.) work.
+	configYamlPath := filepath.Join(beadsDir, "config.yaml")
+	yamlBytes, err := os.ReadFile(configYamlPath)
+	if err != nil {
+		t.Fatalf("config.yaml missing after finalize: %v", err)
+	}
+	yaml := string(yamlBytes)
+
+	// sync.remote must be persisted so subsequent fresh clones (and
+	// bootstrap retries) can rediscover the remote without re-probing
+	// origin refs.
+	if !strings.Contains(yaml, "sync.remote: ") && !strings.Contains(yaml, "sync-remote: ") {
+		t.Errorf("config.yaml does not contain sync.remote entry:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, syncRemote) {
+		t.Errorf("config.yaml does not contain sync remote URL %q:\n%s", syncRemote, yaml)
+	}
+}
+
+func TestFinalizeSyncedBootstrap_WorktreeStubDoesNotShadowTargetConfig(t *testing.T) {
+	restore := snapshotBootstrapEnv(t)
+	defer restore()
+
+	config.ResetForTesting()
+	defer config.ResetForTesting()
+
+	originBare := filepath.Join(t.TempDir(), "origin.git")
+	runGitForBootstrapTest(t, "", "init", "--bare", "--initial-branch=main", originBare)
+
+	sourceDir := t.TempDir()
+	runGitForBootstrapTest(t, sourceDir, "init", "-b", "main")
+	runGitForBootstrapTest(t, sourceDir, "config", "user.email", "test@test.com")
+	runGitForBootstrapTest(t, sourceDir, "config", "user.name", "Test User")
+	runGitForBootstrapTest(t, sourceDir, "commit", "--allow-empty", "-m", "init")
+	runGitForBootstrapTest(t, sourceDir, "remote", "add", "origin", originBare)
+	runGitForBootstrapTest(t, sourceDir, "push", "origin", "main")
+
+	localBare := filepath.Join(t.TempDir(), "local-bare.git")
+	runGitForBootstrapTest(t, "", "clone", "--bare", originBare, localBare)
+
+	worktreeDir := filepath.Join(t.TempDir(), "worktree")
+	runGitForBootstrapTest(t, "", "--git-dir="+localBare, "worktree", "add", worktreeDir, "main")
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(worktreeDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reproduce the failing shape from fix-worktree-config-yaml-resolution:
+	// the worktree has a local .beads stub, but bootstrap is finalizing the
+	// shared config under the bare/common-dir parent.
+	worktreeStubDir := filepath.Join(worktreeDir, ".beads")
+	if err := os.MkdirAll(worktreeStubDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	targetBeadsDir := filepath.Join(localBare, ".beads")
+	if err := os.MkdirAll(filepath.Join(targetBeadsDir, "embeddeddolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	const remoteURL = "git+ssh://git@github.com/gastownhall/gascity.git"
+	cfg := configfile.DefaultConfig()
+	if err := finalizeSyncedBootstrap(targetBeadsDir, remoteURL, cfg, "gascity"); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	targetConfigPath := filepath.Join(targetBeadsDir, "config.yaml")
+	targetContent, err := os.ReadFile(targetConfigPath)
+	if err != nil {
+		t.Fatalf("failed to read target config.yaml: %v", err)
+	}
+	if !strings.Contains(string(targetContent), remoteURL) {
+		t.Fatalf("expected target config.yaml to contain %q, got:\n%s", remoteURL, string(targetContent))
+	}
+
+	if _, err := os.Stat(filepath.Join(worktreeStubDir, "config.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("expected worktree stub config.yaml to remain absent, got err=%v", err)
+	}
+}
+
+// TestFinalizeSyncedBootstrapIsIdempotent verifies that re-running the
+// finalize step over an already-finalized workspace is a no-op — the
+// clone retry path relies on this.
+func TestFinalizeSyncedBootstrapIsIdempotent(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	cfg := configfile.DefaultConfig()
+	if err := finalizeSyncedBootstrap(beadsDir, "file:///tmp/a.git", cfg, "beads_hq"); err != nil {
+		t.Fatalf("first finalize failed: %v", err)
+	}
+
+	firstYaml, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config.yaml after first finalize: %v", err)
+	}
+
+	if err := finalizeSyncedBootstrap(beadsDir, "file:///tmp/a.git", cfg, "beads_hq"); err != nil {
+		t.Fatalf("second finalize failed: %v", err)
+	}
+
+	secondYaml, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config.yaml after second finalize: %v", err)
+	}
+
+	// createConfigYaml skips existing files, so the template portion must
+	// be unchanged. SetYamlConfig rewrites in place but should produce the
+	// same output for the same value.
+	if string(firstYaml) != string(secondYaml) {
+		t.Errorf("config.yaml changed on second finalize.\nfirst:\n%s\nsecond:\n%s", firstYaml, secondYaml)
+	}
+
+	// metadata.json must still load cleanly.
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil || loaded == nil {
+		t.Fatalf("metadata.json missing after second finalize: %v", err)
+	}
+	if loaded.GetDoltDatabase() != "beads_hq" {
+		t.Errorf("dolt_database drifted: got %q, want %q", loaded.GetDoltDatabase(), "beads_hq")
+	}
+}
+
+// TestFinalizeSyncedBootstrapServerModePreservesMode verifies that when
+// metadata.json already declares dolt_mode=server (tracked in git),
+// finalizeSyncedBootstrap preserves server mode instead of resetting to
+// embedded. This is the root cause of GH#3343.
+func TestFinalizeSyncedBootstrapServerModePreservesMode(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	// Simulate a workspace where metadata.json (tracked in git) declares
+	// server mode — the scenario from GH#3343.
+	cfg := &configfile.Config{
+		DoltMode:       configfile.DoltModeServer,
+		DoltServerHost: "127.0.0.1",
+		DoltServerPort: 3308,
+		DoltDatabase:   "beads_proj",
+	}
+
+	if err := finalizeSyncedBootstrap(beadsDir, "file:///tmp/fake.git", cfg, "beads_proj"); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil || loaded == nil {
+		t.Fatalf("metadata.json missing: %v", err)
+	}
+	if loaded.GetDoltMode() != configfile.DoltModeServer {
+		t.Errorf("dolt_mode = %q, want %q — server mode was not preserved", loaded.GetDoltMode(), configfile.DoltModeServer)
+	}
+	if loaded.GetDoltDatabase() != "beads_proj" {
+		t.Errorf("dolt_database = %q, want %q", loaded.GetDoltDatabase(), "beads_proj")
+	}
+}
+
+// TestCloneFromRemoteRoutesToServerMode verifies that cloneFromRemote uses
+// the SQL server path (not filesystem clone) when ResolveServerMode
+// detects external server mode from metadata.json. GH#3343.
+func TestCloneFromRemoteRoutesToServerMode(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write metadata.json with server mode and explicit port — this makes
+	// ResolveServerMode return ServerModeExternal.
+	cfg := &configfile.Config{
+		DoltMode:       configfile.DoltModeServer,
+		DoltServerHost: "127.0.0.1",
+		DoltServerPort: 3308,
+		DoltDatabase:   "beads_proj",
+	}
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("save metadata.json: %v", err)
+	}
+
+	// cloneFromRemote should attempt a server connection (not a filesystem
+	// clone). Since no server is running, we expect a connection error —
+	// NOT a "dolt clone failed" error, which would indicate the filesystem
+	// path was taken.
+	err := cloneFromRemote(t.Context(), beadsDir, "file:///tmp/nonexistent.git", "beads_proj", cfg)
+	if err == nil {
+		t.Fatal("expected error (no server running), got nil")
+	}
+	errMsg := err.Error()
+
+	// The error should indicate a server connection attempt, not a CLI clone.
+	if strings.Contains(errMsg, "dolt clone failed") {
+		t.Errorf("cloneFromRemote used filesystem clone path in server mode: %v", err)
+	}
+	if !strings.Contains(errMsg, "server") {
+		t.Errorf("expected server-related error, got: %v", err)
+	}
+
+	// Verify no local dolt directory was created.
+	doltDir := filepath.Join(beadsDir, "dolt")
+	if _, err := os.Stat(doltDir); err == nil {
+		t.Errorf("local .beads/dolt/ directory was created — clone should have gone to server, not filesystem")
+	}
+}
+
+// TestCloneFromRemoteRoutesToServerModeViaEnv verifies that the
+// BEADS_DOLT_SERVER_MODE=1 env var triggers the server clone path,
+// even when metadata.json is absent.
+func TestCloneFromRemoteRoutesToServerModeViaEnv(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "1")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &configfile.Config{
+		DoltServerHost: "127.0.0.1",
+		DoltServerPort: 3309,
+		DoltDatabase:   "beads_env",
+	}
+
+	err := cloneFromRemote(t.Context(), beadsDir, "file:///tmp/nonexistent.git", "beads_env", cfg)
+	if err == nil {
+		t.Fatal("expected error (no server running), got nil")
+	}
+	if strings.Contains(err.Error(), "dolt clone failed") {
+		t.Errorf("cloneFromRemote used filesystem clone path despite BEADS_DOLT_SERVER_MODE=1: %v", err)
+	}
+	if !strings.Contains(err.Error(), "server") {
+		t.Errorf("expected server-related error, got: %v", err)
+	}
+}
+
+// TestCloneFromRemoteExternalNilCfgLoadsDisk verifies that when cfg is nil
+// in external server mode, cloneFromRemote falls back to loading config
+// from metadata.json on disk.
+func TestCloneFromRemoteExternalNilCfgLoadsDisk(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write metadata.json to disk with server mode — but pass nil cfg.
+	diskCfg := &configfile.Config{
+		DoltMode:       configfile.DoltModeServer,
+		DoltServerHost: "127.0.0.1",
+		DoltServerPort: 3310,
+		DoltDatabase:   "beads_disk",
+	}
+	if err := diskCfg.Save(beadsDir); err != nil {
+		t.Fatalf("save metadata.json: %v", err)
+	}
+
+	// Pass nil cfg — cloneFromRemote should load from disk and still
+	// take the server path.
+	err := cloneFromRemote(t.Context(), beadsDir, "file:///tmp/nonexistent.git", "beads_disk", nil)
+	if err == nil {
+		t.Fatal("expected error (no server running), got nil")
+	}
+	if strings.Contains(err.Error(), "dolt clone failed") {
+		t.Errorf("nil-cfg path used filesystem clone despite server metadata on disk: %v", err)
+	}
+	if !strings.Contains(err.Error(), "server") {
+		t.Errorf("expected server-related error, got: %v", err)
+	}
+}
+
+// TestCloneFromRemoteOwnedModeUsesCLI verifies that owned-server mode
+// (the default when no metadata.json exists) uses the CLI clone path.
+func TestCloneFromRemoteOwnedModeUsesCLI(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// No metadata.json → ResolveServerMode returns ServerModeOwned → CLI path.
+	// The CLI path calls BootstrapFromRemoteWithDB, which requires dolt CLI.
+	// Since dolt may not be installed in CI, we accept either:
+	// - "dolt CLI not found" (no dolt binary)
+	// - "dolt clone failed" (dolt binary exists but remote is invalid)
+	// Both confirm the CLI path was taken, not the server path.
+	err := cloneFromRemote(t.Context(), beadsDir, "file:///tmp/nonexistent.git", "beads_owned", nil)
+	if err == nil {
+		// BootstrapFromRemoteWithDB returns (false, nil) if doltExists — skip.
+		return
+	}
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "dolt server unreachable") || strings.Contains(errMsg, "connect to dolt server") {
+		t.Errorf("owned-mode clone routed to server path: %v", err)
+	}
+}
+
+func TestResolveRemoteCloneModeDefaultConfigUsesEmbedded(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	cfg := configfile.DefaultConfig()
+
+	got := resolveRemoteCloneMode(beadsDir, cfg, remoteCloneAuto)
+	if got != remoteCloneEmbedded {
+		t.Fatalf("resolveRemoteCloneMode(default cfg) = %v, want embedded", got)
+	}
+}
+
+func TestResolveRemoteCloneModeExplicitExternalOverridesMissingMetadata(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	cfg := &configfile.Config{
+		DoltMode:       configfile.DoltModeServer,
+		DoltServerHost: "127.0.0.1",
+		DoltServerPort: 3312,
+		DoltDatabase:   "beads_external",
+	}
+
+	got := resolveRemoteCloneMode(beadsDir, cfg, remoteCloneExternalServer)
+	if got != remoteCloneExternalServer {
+		t.Fatalf("resolveRemoteCloneMode(explicit external) = %v, want external server", got)
+	}
+}
+
+// TestCloneFromRemoteSharedServerModeUsesServer verifies that
+// BEADS_DOLT_SHARED_SERVER=1 triggers the server clone path.
+func TestCloneFromRemoteSharedServerModeUsesServer(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &configfile.Config{
+		DoltServerHost: "127.0.0.1",
+		DoltServerPort: 3311,
+		DoltDatabase:   "beads_shared",
+	}
+
+	err := cloneFromRemote(t.Context(), beadsDir, "file:///tmp/nonexistent.git", "beads_shared", cfg)
+	if err == nil {
+		t.Fatal("expected error (no server running), got nil")
+	}
+	if strings.Contains(err.Error(), "dolt clone failed") {
+		t.Errorf("shared-server mode used filesystem clone: %v", err)
+	}
+	if !strings.Contains(err.Error(), "server") {
+		t.Errorf("expected server-related error, got: %v", err)
+	}
+}
+
+// TestFinalizeSyncedBootstrapSharedServerSetsServerMode verifies that
+// finalizeSyncedBootstrap writes dolt_mode=server when shared-server
+// mode is active via env var.
+func TestFinalizeSyncedBootstrapSharedServerSetsServerMode(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	cfg := configfile.DefaultConfig()
+	if err := finalizeSyncedBootstrap(beadsDir, "file:///tmp/fake.git", cfg, "beads_shared"); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil || loaded == nil {
+		t.Fatalf("metadata.json missing: %v", err)
+	}
+	if loaded.GetDoltMode() != configfile.DoltModeServer {
+		t.Errorf("dolt_mode = %q, want %q — shared server should set server mode", loaded.GetDoltMode(), configfile.DoltModeServer)
 	}
 }

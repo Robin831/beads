@@ -13,7 +13,7 @@ func TestFreshCloneServerResult(t *testing.T) {
 		dbName         string
 		host           string
 		port           int
-		syncGitRemote  string
+		syncRemote     string
 		wantStatus     string
 		wantContains   []string
 		wantNotContain []string
@@ -29,41 +29,41 @@ func TestFreshCloneServerResult(t *testing.T) {
 				"Database exists on server",
 			},
 		},
-		"DB missing, no sync.git-remote returns Warning (FR-020)": {
-			dbExists:      false,
-			dbName:        "acf_beads",
-			host:          "127.0.0.1",
-			port:          3309,
-			syncGitRemote: "",
-			wantStatus:    StatusWarning,
+		"DB missing, no sync.remote returns Warning (FR-020)": {
+			dbExists:   false,
+			dbName:     "acf_beads",
+			host:       "127.0.0.1",
+			port:       3309,
+			syncRemote: "",
+			wantStatus: StatusWarning,
 			wantContains: []string{
 				`"acf_beads"`,
 				"not found on server",
 				"127.0.0.1:3309",
-				"sync.git-remote",
+				"sync.remote",
 				".beads/config.yaml",
 			},
 			wantNotContain: []string{
-				"sync.git-remote is configured",
+				"sync.remote is configured",
 			},
 			wantFix: "bd bootstrap",
 		},
-		"DB missing, sync.git-remote IS configured returns Warning with remote hint": {
-			dbExists:      false,
-			dbName:        "beads_kc",
-			host:          "192.168.1.50",
-			port:          3307,
-			syncGitRemote: "https://doltremoteapi.dolthub.com/myorg/beads",
-			wantStatus:    StatusWarning,
+		"DB missing, sync.remote IS configured returns Warning with remote hint": {
+			dbExists:   false,
+			dbName:     "beads_kc",
+			host:       "192.168.1.50",
+			port:       3307,
+			syncRemote: "https://doltremoteapi.dolthub.com/myorg/beads",
+			wantStatus: StatusWarning,
 			wantContains: []string{
 				`"beads_kc"`,
 				"not found on server",
-				"sync.git-remote is configured",
+				"sync.remote is configured",
 				"https://doltremoteapi.dolthub.com/myorg/beads",
 				"bd bootstrap",
 			},
 			wantNotContain: []string{
-				"Set sync.git-remote in .beads/config.yaml",
+				"Set sync.remote in .beads/config.yaml",
 			},
 			wantFix: "bd bootstrap",
 		},
@@ -71,7 +71,7 @@ func TestFreshCloneServerResult(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			check := freshCloneServerResult(tt.dbExists, tt.dbName, tt.host, tt.port, tt.syncGitRemote)
+			check := freshCloneServerResult(tt.dbExists, tt.dbName, tt.host, tt.port, tt.syncRemote)
 
 			if check.Name != "Fresh Clone" {
 				t.Errorf("expected Name %q, got %q", "Fresh Clone", check.Name)
@@ -103,12 +103,59 @@ func TestFreshCloneServerResult(t *testing.T) {
 func TestCheckFreshCloneDB_ServerUnreachable(t *testing.T) {
 	// FR-030: When server is unreachable, should return Reachable=false
 	// so caller skips the server-mode check without panic.
-	result := checkFreshCloneDB("127.0.0.1", 1, "root", "", "nonexistent_db")
+	result := checkFreshCloneDB("127.0.0.1", 1, "root", "", "nonexistent_db", false)
 	if result.Reachable {
 		t.Fatal("expected Reachable=false for connection refused")
 	}
 	if result.Err == nil {
 		t.Fatal("expected non-nil error for connection refused")
+	}
+}
+
+func TestCheckFreshClone_ServerModeUnreachable(t *testing.T) {
+	// bd-tzo9: When metadata.json declares dolt_mode=server but the server
+	// is unreachable, CheckFreshClone must resolve credentials by the
+	// *resolved runtime port* (not the deprecated metadata port default),
+	// invoke checkFreshCloneDB, observe Reachable=false, and fall through
+	// to the existing JSONL-based warning. This exercises the
+	// GetDoltServerPasswordForPort(port) code path.
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// JSONL with issues so the check proceeds past the fresh-clone gate.
+	jsonl := `{"id":"bd-abc","title":"t"}` + "\n" + `{"id":"bd-def","title":"t"}` + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(jsonl), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// metadata.json declaring server mode pointed at an unreachable host:port.
+	// Port 1 is guaranteed-unreachable on loopback; Reachable=false exercises
+	// the FR-030 fall-through branch that contains the fixed password-resolution
+	// line.
+	meta := `{
+  "database": "beads.db",
+  "dolt_mode": "server",
+  "dolt_server_host": "127.0.0.1",
+  "dolt_server_port": 1,
+  "dolt_server_user": "root",
+  "dolt_database": "beads"
+}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckFreshClone(tmpDir)
+
+	// Server unreachable → falls through to legacy JSONL-based warning.
+	if check.Status != StatusWarning {
+		t.Fatalf("expected %q on unreachable server fall-through, got %q (message: %s)",
+			StatusWarning, check.Status, check.Message)
+	}
+	if !strings.Contains(check.Fix, "bd bootstrap") {
+		t.Errorf("expected fall-through fix to mention 'bd bootstrap', got: %s", check.Fix)
 	}
 }
 

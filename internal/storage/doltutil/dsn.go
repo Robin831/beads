@@ -10,6 +10,7 @@ import (
 // ServerDSN holds connection parameters for building a MySQL DSN to a Dolt server.
 // All DSNs built with this struct set parseTime=true and multiStatements=true.
 type ServerDSN struct {
+	Socket   string // Unix domain socket path; when set, Net="unix" and Host/Port are ignored
 	Host     string
 	Port     int
 	User     string
@@ -27,11 +28,18 @@ func (d ServerDSN) String() string {
 		timeout = 5 * time.Second
 	}
 
+	net := "tcp"
+	addr := fmt.Sprintf("%s:%d", d.Host, d.Port)
+	if d.Socket != "" {
+		net = "unix"
+		addr = d.Socket
+	}
+
 	cfg := mysql.Config{
 		User:                 d.User,
 		Passwd:               d.Password,
-		Net:                  "tcp",
-		Addr:                 fmt.Sprintf("%s:%d", d.Host, d.Port),
+		Net:                  net,
+		Addr:                 addr,
 		DBName:               d.Database,
 		ParseTime:            true,
 		MultiStatements:      true,
@@ -40,6 +48,12 @@ func (d ServerDSN) String() string {
 	}
 	if d.TLS {
 		cfg.TLSConfig = "true"
+	} else {
+		// go-sql-driver/mysql v1.8+ defaults to tls=preferred when TLSConfig
+		// is empty. Dolt servers without TLS reject preferred-mode negotiation
+		// with "TLS requested but server does not support TLS". Explicitly
+		// disable TLS so connections work against non-TLS Dolt instances.
+		cfg.TLSConfig = "false"
 	}
 
 	return cfg.FormatDSN()

@@ -234,7 +234,7 @@ func enrichCLIVersion(dc DoctorCheck) agentEnrichment {
 		explanation: fmt.Sprintf("CLI version check: %s. An outdated CLI may lack bug fixes or schema migrations needed by the current database.", dc.Message),
 		observed:    dc.Message,
 		expected:    "CLI version matches latest GitHub release",
-		commands:    []string{"go install github.com/steveyegge/beads/cmd/bd@latest"},
+		commands:    []string{installScriptCommand},
 		sourceFiles: []string{"cmd/bd/doctor/version.go:CheckCLIVersion"},
 	}
 }
@@ -309,10 +309,10 @@ func enrichFreshClone(dc DoctorCheck) agentEnrichment {
 	commands := []string{"bd bootstrap"}
 	explanation := fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the local database has not been recovered yet. Run bd bootstrap as the safe existing-project recovery entry point.", dc.Message)
 
-	// When the message mentions sync.git-remote, include it in the suggested commands.
-	if strings.Contains(dc.Message, "sync.git-remote") {
-		explanation = fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the database is not found on the configured server. Run bd bootstrap as the safe entry point; if bootstrap cannot find the expected remote automatically, then set sync.git-remote in .beads/config.yaml and rerun bd bootstrap.", dc.Message)
-		commands = []string{"bd bootstrap", "Set sync.git-remote in .beads/config.yaml if bootstrap cannot find the expected remote"}
+	// When the message mentions sync.remote, include it in the suggested commands.
+	if strings.Contains(dc.Message, "sync.remote") {
+		explanation = fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the database is not found on the configured server. Run bd bootstrap as the safe entry point; if bootstrap cannot find the expected remote automatically, then set sync.remote in .beads/config.yaml and rerun bd bootstrap.", dc.Message)
+		commands = []string{"bd bootstrap", "Set sync.remote in .beads/config.yaml if bootstrap cannot find the expected remote"}
 	}
 
 	return agentEnrichment{
@@ -582,7 +582,7 @@ func enrichBdInPath(dc DoctorCheck) agentEnrichment {
 		explanation: fmt.Sprintf("bd not in PATH: %s. Claude Code hooks invoke bd commands, but bd is not found in the system PATH. Hooks will fail silently.", dc.Message),
 		observed:    dc.Message,
 		expected:    "'bd' executable is in PATH and runnable",
-		commands:    []string{"which bd", "go install github.com/steveyegge/beads/cmd/bd@latest"},
+		commands:    []string{"which bd", installScriptCommand},
 		sourceFiles: []string{"cmd/bd/doctor/claude.go:CheckBdInPath"},
 	}
 }

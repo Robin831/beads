@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -103,20 +104,13 @@ func runExport(cmd *cobra.Command, args []string) error {
 		filter.IsTemplate = &isTemplate
 	}
 
-	// Fetch all matching issues from the issues table
+	// Fetch all issues (persistent + wisps). SearchIssues with Ephemeral=nil
+	// already queries both the issues and wisps tables with ID-based dedup
+	// (see issueops/search.go). A separate Ephemeral=true query would cause
+	// every wisp to appear twice in the output (GH#3352).
 	issues, err := store.SearchIssues(ctx, "", filter)
 	if err != nil {
 		return fmt.Errorf("failed to search issues: %w", err)
-	}
-
-	// Also fetch wisps (ephemeral beads) using the store's ephemeral routing.
-	// SearchIssues with Ephemeral=true queries the wisps table directly.
-	ephemeral := true
-	wispFilter := filter
-	wispFilter.Ephemeral = &ephemeral
-	wispIssues, err := store.SearchIssues(ctx, "", wispFilter)
-	if err == nil && len(wispIssues) > 0 {
-		issues = append(issues, wispIssues...)
 	}
 
 	// Scrub test/pollution records if requested
@@ -163,11 +157,14 @@ func runExport(cmd *cobra.Command, args []string) error {
 		// MarshalJSON to fail with "year outside of range [0,9999]". (GH#2488)
 		sanitizeZeroTime(issue)
 
-		record := &types.IssueWithCounts{
-			Issue:           issue,
-			DependencyCount: counts.DependencyCount,
-			DependentCount:  counts.DependentCount,
-			CommentCount:    commentCounts[issue.ID],
+		record := &exportIssueRecord{
+			RecordType: "issue",
+			IssueWithCounts: &types.IssueWithCounts{
+				Issue:           issue,
+				DependencyCount: counts.DependencyCount,
+				DependentCount:  counts.DependentCount,
+				CommentCount:    commentCounts[issue.ID],
+			},
 		}
 
 		data, err := json.Marshal(record)
@@ -191,10 +188,16 @@ func runExport(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to read config for memories: %w", err)
 		}
 		fullPrefix := kvPrefix + memoryPrefix
-		for k, v := range allConfig {
-			if !strings.HasPrefix(k, fullPrefix) {
-				continue
+		// Sort keys for deterministic output order (GH#3474).
+		var memKeys []string
+		for k := range allConfig {
+			if strings.HasPrefix(k, fullPrefix) {
+				memKeys = append(memKeys, k)
 			}
+		}
+		sort.Strings(memKeys)
+		for _, k := range memKeys {
+			v := allConfig[k]
 			userKey := strings.TrimPrefix(k, fullPrefix)
 			record := map[string]string{
 				"_type": "memory",
@@ -232,6 +235,14 @@ func runExport(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// exportIssueRecord wraps IssueWithCounts with a _type discriminator so that
+// every line in the JSONL export is self-describing. Memory lines already
+// carry "_type":"memory"; this gives issue lines "_type":"issue". (GH#3271)
+type exportIssueRecord struct {
+	RecordType string `json:"_type"`
+	*types.IssueWithCounts
 }
 
 // sanitizeZeroTime replaces Go zero-value time.Time fields with Unix epoch.

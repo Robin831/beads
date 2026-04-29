@@ -15,6 +15,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt/migrations"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
@@ -78,6 +79,10 @@ func WithLock(lock Unlocker) Option {
 // (GH#2571). The lock is released when Close is called, unless a pre-acquired
 // lock was supplied via WithLock (in which case the caller is responsible for it).
 func New(ctx context.Context, beadsDir, database, branch string, opts ...Option) (*EmbeddedDoltStore, error) {
+	if database == "" {
+		return nil, fmt.Errorf("embeddeddolt: database name must not be empty (caller should default to %q)", "beads")
+	}
+
 	var o options
 	for _, fn := range opts {
 		fn(&o)
@@ -122,6 +127,17 @@ func New(ctx context.Context, beadsDir, database, branch string, opts ...Option)
 			lock.Unlock()
 		}
 		return nil, fmt.Errorf("embeddeddolt: init schema: %w", err)
+	}
+
+	// Ensure dolt_ignore'd wisp tables exist in the working set.
+	// After a clone or branch switch, these tables are absent because
+	// dolt_ignore prevents them from being committed. Server mode handles
+	// this in newServerMode(); embedded mode must do it here. (GH#3270)
+	if err := s.ensureIgnoredTables(ctx); err != nil {
+		if ownsLock {
+			lock.Unlock()
+		}
+		return nil, fmt.Errorf("embeddeddolt: ensure ignored tables: %w", err)
 	}
 
 	return s, nil
@@ -217,11 +233,21 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 // committing them to Dolt history. Uses withRootConn so the database can be
 // created before USE; this avoids running CREATE DATABASE inside withConn,
 // which is not safe for concurrent use in the embedded Dolt engine.
+//
+// After the schema-migration transaction commits, a fresh *sql.DB is opened
+// and used to drive the idempotent compat-migration runner. Mirrors the
+// server-mode open path in dolt/store.go:initSchemaOnDB and repairs
+// pre-existing embedded databases that predate the embedded migration
+// system's full coverage (GH#3412).
 func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
-	return s.withRootConn(ctx, true, func(tx *sql.Tx) error {
+	if err := s.withRootConn(ctx, true, func(tx *sql.Tx) error {
 		if s.database != "" {
 			if !validIdentifier.MatchString(s.database) {
-				return fmt.Errorf("embeddeddolt: invalid database name: %q", s.database)
+				msg := fmt.Sprintf("embeddeddolt: invalid database name: %q", s.database)
+				if strings.ContainsRune(s.database, '-') {
+					msg += "; hyphens are not allowed in embedded mode — replace with underscores in .beads/metadata.json dolt_database field, or run 'bd doctor'"
+				}
+				return errors.New(msg)
 			}
 			if _, err := tx.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+s.database+"`"); err != nil {
 				return fmt.Errorf("embeddeddolt: creating database: %w", err)
@@ -234,6 +260,13 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 					return fmt.Errorf("embeddeddolt: setting branch: %w", err)
 				}
 			}
+		}
+
+		// Ensure dolt_ignore'd tables exist before migrations — some migrations
+		// reference these tables (e.g. 0027 alters wisps, 0030 inserts into
+		// local_metadata). After a clone they don't exist yet.
+		if err := schema.EnsureIgnoredTables(ctx, tx); err != nil {
+			return fmt.Errorf("ensure ignored tables before migration: %w", err)
 		}
 
 		applied, err := schema.MigrateUp(ctx, tx)
@@ -253,6 +286,32 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 			}
 		}
 		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Run idempotent compat migrations on a fresh connection scoped to the
+	// newly-created database and branch. The embedded migration system only
+	// covers databases created from fresh init; pre-existing databases that
+	// predate specific SQL migrations need the defensive compat runner to
+	// repair missing columns and tables (GH#3412).
+	db, cleanup, err := OpenSQL(ctx, s.dataDir, s.database, s.branch)
+	if err != nil {
+		return fmt.Errorf("embeddeddolt: open for compat migrations: %w", err)
+	}
+	defer func() { _ = cleanup() }()
+
+	if err := migrations.RunCompatMigrations(db); err != nil {
+		return fmt.Errorf("embeddeddolt: compat migrations: %w", err)
+	}
+	return nil
+}
+
+// ensureIgnoredTables creates dolt_ignore'd wisp tables if they don't exist.
+// Uses withConn (not withRootConn) because the database is already created.
+func (s *EmbeddedDoltStore) ensureIgnoredTables(ctx context.Context) error {
+	return s.withConn(ctx, false, func(tx *sql.Tx) error {
+		return schema.EnsureIgnoredTables(ctx, tx)
 	})
 }
 
@@ -404,14 +463,16 @@ func (s *EmbeddedDoltStore) GetAllEventsSince(ctx context.Context, since time.Ti
 
 // RunInTransaction is implemented in transaction.go.
 
-// Close marks the store as closed and releases the exclusive flock on the data
-// directory (if the store owns it). Subsequent method calls will return errClosed.
+// Close marks the store as closed, cleans up orphaned git-remote-cache
+// garbage, and releases the exclusive flock on the data directory (if the
+// store owns it). Subsequent method calls will return errClosed.
 // It is safe to call multiple times. When the lock was supplied by the caller
 // via WithLock, Close does NOT release it — the caller retains ownership.
 func (s *EmbeddedDoltStore) Close() error {
 	// Use CompareAndSwap so we only unlock once even if Close is called
 	// multiple times (the Lock.Unlock method panics on double-unlock).
 	if s.closed.CompareAndSwap(false, true) {
+		s.cleanGitRemoteCacheGarbage()
 		if s.lock != nil && s.ownsLock {
 			s.lock.Unlock()
 		}
@@ -740,7 +801,7 @@ func (s *EmbeddedDoltStore) GetCustomTypes(ctx context.Context) ([]string, error
 		if yamlTypes := config.GetCustomTypesFromYAML(); len(yamlTypes) > 0 {
 			return yamlTypes, nil
 		}
-		return nil, nil
+		return nil, err
 	}
 	return result, nil
 }

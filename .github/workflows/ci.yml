@@ -12,12 +12,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  detect-ci-tier:
+    name: Detect CI tier
+    runs-on: ubuntu-latest
+    outputs:
+      full_embedded: ${{ steps.tier.outputs.full_embedded }}
+      reason: ${{ steps.tier.outputs.reason }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Decide embedded Dolt coverage
+        id: tier
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash .github/scripts/ci-embedded-tier.sh
+
+  # Fast check: every `go build|test|run|generate|install` invocation in
+  # tracked scripts/hooks/CI carries -tags=gms_pure_go. Prevents ICU-linkage
+  # regressions from re-entering the build (see docs/ICU-POLICY.md).
+  check-build-tags:
+    name: Check build-tag policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - run: ./scripts/check-build-tags.sh
+      - run: ./scripts/check-go-install-guidance.sh
+
   # Fast check to ensure all version files are in sync
   check-version-consistency:
     name: Check version consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Check all versions match
         run: ./scripts/check-versions.sh
@@ -27,20 +56,15 @@ jobs:
     name: Check doc flags freshness
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: 'go.mod'
 
-      - name: Install ICU4C
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libicu-dev
-
       - name: Build bd
-        run: go build -o bd ./cmd/bd/
+        run: go build -tags gms_pure_go -o bd ./cmd/bd/
 
       - name: Validate docs against CLI
         run: ./scripts/check-doc-flags.sh ./bd
@@ -51,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
@@ -89,39 +113,34 @@ jobs:
             coverage: false
             test-flags: '-v -race -short'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: 'go.mod'
 
-      - name: Install ICU4C (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libicu-dev
+      - name: Install Dolt (Linux)
+        if: runner.os == 'Linux'
+        run: curl -fsSL https://github.com/dolthub/dolt/releases/latest/download/install.sh | sudo bash
 
-      - name: Install ICU4C (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew install icu4c
-          dir="$(brew --prefix icu4c)"
-          echo "CGO_CPPFLAGS=-I$dir/include" >> "$GITHUB_ENV"
-          echo "CGO_LDFLAGS=-L$dir/lib -Wl,-rpath,$dir/lib" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=$dir/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: Install Dolt (macOS)
+        if: runner.os == 'macOS'
+        run: brew install dolt
 
-      - name: Configure Git
+      - name: Configure Git and Dolt identity
         run: |
           git config --global user.name "CI Bot"
           git config --global user.email "ci@beads.test"
+          dolt config --global --add user.name "CI Bot"
+          dolt config --global --add user.email "ci@beads.test"
 
       - name: Install gotestsum
         if: matrix.coverage
         run: go install gotest.tools/gotestsum@latest
 
       - name: Build
-        run: go build -v ./cmd/bd
+        run: go build -v -tags gms_pure_go ./cmd/bd
 
       - name: Test (with coverage + JUnit XML)
         if: matrix.coverage
@@ -129,15 +148,16 @@ jobs:
           gotestsum \
             --junitfile junit.xml \
             --format testdox \
-            -- -race -short -coverprofile=coverage.out -skip '^TestEmbedded' ./...
+            -- -tags gms_pure_go -race -short -coverprofile=coverage.out -skip '^TestEmbedded' ./...
 
       - name: Test
         if: ${{ !matrix.coverage }}
-        run: go test ${{ matrix.test-flags }} -skip '^TestEmbedded' ./...
+        run: go test -tags gms_pure_go ${{ matrix.test-flags }} -skip '^TestEmbedded' ./...
 
       - name: Upload coverage to Codecov
         if: matrix.coverage && !cancelled()
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6
+        continue-on-error: true
         with:
           files: coverage.out
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -145,7 +165,8 @@ jobs:
 
       - name: Upload test results to Codecov
         if: matrix.coverage && !cancelled()
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6
+        continue-on-error: true
         with:
           files: junit.xml
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -155,35 +176,33 @@ jobs:
   # Embedded Dolt tests - test the in-process Dolt engine (no server required)
   #
   # Split into: build → storage tests + parallel cmd test shards.
-  # Adding new *_embedded_test.go files auto-distributes via hash sharding.
+  # cmd/bd embedded tests use a committed shard manifest; newly-added tests
+  # still auto-distribute via hash fallback until the manifest is updated.
 
   build-embedded:
     name: Build (Embedded Dolt)
+    needs: detect-ci-tier
+    if: needs.detect-ci-tier.outputs.full_embedded == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: 'go.mod'
 
-      - name: Install ICU4C
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libicu-dev
-
       - name: Build embedded bd binary
-        run: go build -race -o /tmp/bd-embedded-test ./cmd/bd/
+        run: go build -tags gms_pure_go -race -o /tmp/bd-embedded-test ./cmd/bd/
 
       - name: Build embedded storage test binary
-        run: go test -race -c -o /tmp/embeddeddolt-test ./internal/storage/embeddeddolt/
+        run: go test -tags gms_pure_go -race -c -o /tmp/embeddeddolt-test ./internal/storage/embeddeddolt/
 
       - name: Build embedded cmd test binary
-        run: go test -race -c -o /tmp/bd-cmd-test ./cmd/bd/
+        run: go test -tags gms_pure_go -race -c -o /tmp/bd-cmd-test ./cmd/bd/
 
       - name: Upload binaries
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: embedded-test-binaries
           path: |
@@ -194,18 +213,14 @@ jobs:
 
   test-embedded-storage:
     name: Test (Embedded Dolt Storage)
-    needs: build-embedded
+    needs: [detect-ci-tier, build-embedded]
+    if: needs.detect-ci-tier.outputs.full_embedded == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Install ICU4C
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libicu-dev
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Download binaries
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: embedded-test-binaries
           path: /tmp/
@@ -226,22 +241,18 @@ jobs:
 
   test-embedded-cmd:
     name: Test (Embedded Dolt Cmd ${{ matrix.shard }}/${{ strategy.job-total }})
-    needs: build-embedded
+    needs: [detect-ci-tier, build-embedded]
+    if: needs.detect-ci-tier.outputs.full_embedded == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Install ICU4C
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libicu-dev
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Download binaries
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: embedded-test-binaries
           path: /tmp/
@@ -270,10 +281,10 @@ jobs:
     name: Test (Windows - smoke)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: 'go.mod'
 
@@ -295,10 +306,10 @@ jobs:
     name: Check formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: 'go.mod'
 
@@ -309,44 +320,30 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: 'go.mod'
 
-      - name: Install ICU4C (Linux)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libicu-dev
-
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9
         with:
           version: latest
-          args: --timeout=5m
+          args: --timeout=5m --build-tags=gms_pure_go
 
   test-nix:
     name: Test Nix Flake
     runs-on: ubuntu-latest
-    # Allow failure until nixpkgs updates Go to 1.25.6+
-    # (dolthub/driver requires go 1.25.6, nixpkgs-unstable has go 1.25.1)
-    continue-on-error: true
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: cachix/install-nix-action@v31
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: DeterminateSystems/determinate-nix-action@92ffb5400c3776307a27a1727d7e2ac3dcd9f844 # v3
       - name: Run bd help via Nix
         id: nix_help
-        continue-on-error: true
         run: |
-          export BEADS_DB="$PWD/.ci-beads/beads.db"
-          mkdir -p "$(dirname "$BEADS_DB")"
-          rm -rf .beads
-          nix run .#default -- --db "$BEADS_DB" init --quiet --prefix ci
-          nix run .#default -- --db "$BEADS_DB" > help.txt
+          nix run .#default -- --help > help.txt
       - name: Verify help text
         if: steps.nix_help.outcome == 'success'
         run: |
@@ -359,6 +356,3 @@ jobs:
             exit 1
           fi
           echo "Help text first line is correct"
-      - name: Note soft-failed Nix run
-        if: steps.nix_help.outcome != 'success'
-        run: echo "Nix run is non-blocking until nixpkgs toolchain catches up; skipping help-text assertion."

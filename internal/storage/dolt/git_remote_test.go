@@ -1004,9 +1004,7 @@ func findClonedDBName(t *testing.T, doltDir string) string {
 // false when the SQL server reports a git-protocol remote but the CLI directory
 // (dbPath) lacks that remote.
 func TestGitRemoteExternalServerRouting(t *testing.T) {
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("dolt not installed, skipping test")
-	}
+	testutil.RequireDoltBinary(t)
 	skipIfNoGit(t)
 
 	baseDir, err := os.MkdirTemp("", "external-server-routing-*")
@@ -1092,7 +1090,7 @@ func TestGitRemoteExternalServerRouting(t *testing.T) {
 
 	// SQL sees git+https:// remote in testdb; CLI directory (clientDataDir) has none.
 	// isGitProtocolRemote should return false to route through SQL.
-	require.False(t, store.isGitProtocolRemote(ctx))
+	require.False(t, store.isGitProtocolRemote(ctx, store.remote))
 }
 
 // TestCredentialCLIRoutingE2E verifies that Push succeeds via CLI subprocess
@@ -1108,9 +1106,7 @@ func TestGitRemoteExternalServerRouting(t *testing.T) {
 // If the guard fails and falls through to SQL withEnvCredentials, the external
 // server process cannot see the env vars and push fails (SC-001).
 func TestCredentialCLIRoutingE2E(t *testing.T) {
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("dolt not installed, skipping test")
-	}
+	testutil.RequireDoltBinary(t)
 	skipIfNoGit(t)
 
 	baseDir, err := os.MkdirTemp("", "credential-cli-routing-e2e-*")
@@ -1218,8 +1214,8 @@ func TestCredentialCLIRoutingE2E(t *testing.T) {
 	t.Cleanup(func() { store.Close() })
 
 	// Verify preconditions: not a git-protocol remote, but credentials trigger CLI routing
-	require.False(t, store.isGitProtocolRemote(ctx), "file:// is not git-protocol")
-	require.True(t, store.shouldUseCLIForCredentials(ctx), "should route through CLI for credentials")
+	require.False(t, store.isGitProtocolRemote(ctx, store.remote), "file:// is not git-protocol")
+	require.True(t, store.shouldUseCLIForCredentials(ctx, store.remote, store.mainRemoteCredentials()), "should route through CLI for credentials")
 	require.True(t, store.serverMode, "store should be in server mode")
 
 	// 7. Push should succeed via CLI credential routing

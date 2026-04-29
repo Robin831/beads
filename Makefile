@@ -3,13 +3,13 @@
 # On Windows, GNU Make defaults to cmd.exe which doesn't support POSIX
 # shell syntax used throughout this Makefile. Use Git for Windows' bash.
 ifeq ($(OS),Windows_NT)
-GIT_BASH := $(shell where git 2>nul)
+GIT_BASH := $(shell where git 2>/dev/null)
 ifneq ($(GIT_BASH),)
 SHELL := $(subst cmd,bin,$(subst git.exe,bash.exe,$(GIT_BASH)))
 endif
 endif
 
-.PHONY: all build test test-full-cgo test-regression test-upgrade test-cross-version test-migration bench bench-quick clean install install-force help check-up-to-date fmt fmt-check
+.PHONY: all build test test-icu-path test-full-cgo test-regression test-upgrade test-cross-version test-migration bench bench-quick clean install install-force help check-up-to-date fmt fmt-check
 
 # Default target
 all: build
@@ -43,7 +43,8 @@ endif
 # gms_pure_go tells go-mysql-server to use Go's stdlib regex instead of
 # ICU-backed go-icu-regex.  This eliminates the ICU shared-library runtime
 # dependency, making release binaries portable across Linux distros.
-# ICU flags are only needed for test-cgo.sh (which exercises the ICU path).
+# ICU flags are only needed for scripts/test-icu-path.sh (which exercises the
+# opt-in ICU regex path).
 BUILD_TAGS := gms_pure_go
 
 # Build the bd binary
@@ -64,18 +65,25 @@ test:
 	@echo "Running tests..."
 	@TEST_COVER=1 ./scripts/test.sh
 
-# Run full CGO-enabled test suite (no skip list).
-# On macOS, auto-configures ICU include/link flags.
+# Run the opt-in ICU regex path test suite (no skip list).
+# This is a local developer workflow for intentionally exercising the leftover
+# ICU path; it is not part of normal validation.
+test-icu-path:
+	@echo "Running opt-in ICU regex path tests..."
+	@./scripts/test-icu-path.sh ./...
+
+# Deprecated compatibility alias. Keep forwarding so old local notes still work,
+# but make the opt-in ICU nature explicit.
 test-full-cgo:
-	@echo "Running full CGO-enabled tests..."
-	@./scripts/test-cgo.sh ./...
+	@echo "WARNING: make test-full-cgo is deprecated; use make test-icu-path for the explicit ICU-only path." >&2
+	@$(MAKE) test-icu-path
 
 # Run differential regression tests (baseline v0.49.6 vs current worktree).
 # Downloads baseline binary on first run; cached in ~/Library/Caches/beads-regression/.
 # Override baseline: BD_REGRESSION_BASELINE_BIN=/path/to/bd make test-regression
 test-regression:
 	@echo "Running regression tests (baseline vs candidate)..."
-	go test -tags=regression -timeout=10m -v ./tests/regression/...
+	go test -tags=regression,$(BUILD_TAGS) -timeout=10m -v ./tests/regression/...
 
 # Run upgrade smoke tests (release stability gate).
 # Tests that upgrading from previous release preserves data, role, and mode.
@@ -83,6 +91,7 @@ test-regression:
 test-upgrade: build
 	@echo "Running upgrade smoke tests..."
 	@CANDIDATE_BIN=./bd ./scripts/upgrade-smoke-test.sh
+
 
 # Run cross-version smoke tests (last 30 tags → candidate).
 # Creates epic, issues, and dependencies with old versions, upgrades, verifies.
@@ -100,20 +109,21 @@ test-migration: build
 	@echo "Running migration test harness..."
 	@CANDIDATE_BIN=./bd ./scripts/migration-test/run.sh
 
+
 # Run performance benchmarks against Dolt storage backend
 # Requires CGO and Dolt; generates CPU profile files
 # View flamegraph: go tool pprof -http=:8080 <profile-file>
 bench:
 	@echo "Running performance benchmarks (Dolt backend)..."
 	@echo ""
-	go test -bench=. -benchtime=1s -benchmem -run=^$$ ./internal/storage/dolt/ -timeout=30m
+	go test -tags "$(BUILD_TAGS)" -bench=. -benchtime=1s -benchmem -run=^$$ ./internal/storage/dolt/ -timeout=30m
 	@echo ""
 	@echo "Benchmark complete."
 
 # Run quick benchmarks (shorter benchtime for faster feedback)
 bench-quick:
 	@echo "Running quick performance benchmarks..."
-	go test -bench=. -benchtime=100ms -benchmem -run=^$$ ./internal/storage/dolt/ -timeout=15m
+	go test -tags "$(BUILD_TAGS)" -bench=. -benchtime=100ms -benchmem -run=^$$ ./internal/storage/dolt/ -timeout=15m
 
 # Check that local branch is up to date with origin/main
 check-up-to-date:
@@ -138,7 +148,7 @@ endif
 install install-force: build
 	@mkdir -p $(INSTALL_DIR)
 ifeq ($(OS),Windows_NT)
-	@rm -f $(INSTALL_DIR)/bd.exe
+	@rm -f $(INSTALL_DIR)/bd $(INSTALL_DIR)/bd.exe
 	@cp $(BUILD_DIR)/bd.exe $(INSTALL_DIR)/bd.exe
 	@echo "Installed bd.exe to $(INSTALL_DIR)/bd.exe"
 else
@@ -189,7 +199,8 @@ help:
 	@echo "Beads Makefile targets:"
 	@echo "  make build        - Build the bd binary"
 	@echo "  make test         - Run all tests"
-	@echo "  make test-full-cgo - Run full CGO-enabled test suite"
+	@echo "  make test-icu-path - Run opt-in ICU regex path tests (maintainer-only)"
+	@echo "  make test-full-cgo - Deprecated alias for make test-icu-path"
 	@echo "  make test-regression - Run differential regression tests (baseline vs candidate)"
 	@echo "  make test-upgrade  - Run upgrade smoke tests (release stability gate)"
 	@echo "  make test-cross-version - Run cross-version smoke tests (last 30 tags)"

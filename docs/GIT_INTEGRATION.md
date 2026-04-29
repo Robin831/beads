@@ -20,9 +20,10 @@ Git worktrees share the same `.git` directory and `.beads` database:
 ### Worktree-Aware Features
 
 **Database Discovery:**
-- Searches main repository first for `.beads` directory
+- Resolves the active workspace using `BEADS_DIR`, worktree fallback, and shared main-repo `.beads`
 - Falls back to worktree-local search if needed
 - Prevents database duplication across worktrees
+- Use `bd where` as the authoritative check; local `./.beads` may be absent in pure worktree or redirected setups
 
 **Git Operations:**
 - Worktree-aware repository root detection
@@ -36,6 +37,7 @@ Git worktrees share the same `.git` directory and `.beads` database:
 Sync with remotes using Dolt's native push/pull:
 
 ```bash
+bd init --remote http://myserver:7007/mydb  # First setup or clone from a Dolt remote
 bd dolt push    # Push changes to Dolt remote
 bd dolt pull    # Pull changes from Dolt remote
 ```

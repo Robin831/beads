@@ -8,9 +8,9 @@ This document contains detailed operational instructions for AI agents working o
 
 ### Code Standards
 
-- **Go version**: 1.24+
+- **Go version**: see `go.mod` for the required version (currently 1.26+)
 - **Linting**: `golangci-lint run ./...` (baseline warnings documented in [docs/LINTING.md](docs/LINTING.md))
-- **Testing**: All new features need tests (`make test` for local baseline, `make test-full-cgo` when validating full CGO paths)
+- **Testing**: All new features need tests (`make test` for the normal local/CI path, `make test-icu-path` only when intentionally exercising the opt-in ICU regex path)
 - **Documentation**: Update relevant .md files
 
 ### File Organization
@@ -66,7 +66,7 @@ into temp repos and produce flaky test behavior.
 ### Before Committing
 
 1. **Run tests**: `make test` (or `./scripts/test.sh`)
-   - For full CGO validation: `make test-full-cgo`
+   - Only if intentionally exercising the ICU regex path: `make test-icu-path`
 2. **Run linter**: `golangci-lint run ./...` (ignore baseline warnings)
 3. **Update docs**: If you changed behavior, update README.md or other docs
 4. **Commit**: With git hooks installed (`bd hooks install`), Dolt changes are auto-committed
@@ -101,19 +101,29 @@ bd hooks install
 
 **Merge conflicts**: Rare with hash IDs. Dolt uses cell-level 3-way merge for conflict resolution.
 
-## Git Workflow: Push to Main, Never PR
+## Git Workflow: PR by Default
 
-Crew workers push directly to main. **Never create pull requests.**
+Crew workers use a PR-based workflow. Beads is a dependency of Gas City, so we
+defer to the standard PR flow to keep changes reviewable.
 
-- `git push` to main is the only way to land work
-- `gh pr create` is forbidden — PRs are for external contributors, not crew
-- Do not create feature branches for your own work — commit and push to main
-- When handling external PRs, use fix-merge: checkout the PR branch locally,
-  fix/rebase onto main, merge locally, `git push`, then close the PR
+- Work on a feature branch, push the branch, open a PR against `main`
+- `gh pr create` is the normal path to land work
+- Direct push to main is reserved for releases (tag + release commit) and
+  narrow operational fixes; prefer a PR when unsure
+- When handling external contributor PRs, use fix-merge: checkout the PR
+  branch locally, fix/rebase onto main, merge via PR, then close the PR
 
 ### External Contributor PRs: Check Before You Build
 
 **Read [CONTRIBUTING.md](CONTRIBUTING.md)** — it contains promises we've made to contributors. Violating them damages trust and community.
+
+Run the read-only preflight before implementing related work, opening a PR, or
+merging/closing a PR:
+
+```bash
+scripts/pr-preflight.sh --search "<topic keywords>" --repo gastownhall/beads
+scripts/pr-preflight.sh <pr-number> --repo gastownhall/beads
+```
 
 **Before implementing any feature or fix, check for existing open PRs on the same topic:**
 
@@ -130,7 +140,8 @@ gh pr list --repo gastownhall/beads --state open --search "<topic keywords>" --j
 
 If you must rewrite (e.g., fundamentally different approach needed), explain why on the original PR and credit the contributor's design/tests in your commits.
 
-This is enforced by pre-use hooks. If you try `gh pr create`, it will be blocked.
+Do not rely on auto-discovery of CONTRIBUTING.md; the preflight is the agent
+gate for PR handling.
 
 ## Landing the Plane
 
@@ -140,8 +151,8 @@ This is enforced by pre-use hooks. If you try `gh pr create`, it will be blocked
 
 1. **File beads issues for any remaining work** that needs follow-up
 2. **Ensure all quality gates pass** (only if code changes were made):
-   - Run `make lint` or `golangci-lint run ./...` (if pre-commit installed: `pre-commit run --all-files`)
-   - Run `make test` (and `make test-full-cgo` when CGO-relevant code changed)
+   - Run `golangci-lint run ./...` (if pre-commit installed: `pre-commit run --all-files`)
+   - Run `make test` (and `make test-icu-path` only if you intentionally need the ICU regex path)
    - File P0 issues if quality gates are broken
 3. **Update beads issues** - close finished work, update status
 4. **PUSH TO REMOTE - NON-NEGOTIABLE** - This step is MANDATORY. Execute ALL commands below:
@@ -183,7 +194,7 @@ This is enforced by pre-use hooks. If you try `gh pr create`, it will be blocked
 bd create "Add integration tests for sync" -t task -p 2 --json
 
 # 2. Run quality gates (only if code changes were made)
-go test -short ./...
+make test
 golangci-lint run ./...
 
 # 3. Close finished issues
@@ -226,6 +237,28 @@ bd update <id> --design "design notes"
 bd update <id> --notes "additional notes"
 bd update <id> --acceptance "acceptance criteria"
 ```
+
+**Read execution metadata before prose.** When enacting a bd issue, inspect the
+structured metadata before using description or notes to choose execution mode,
+delegation, model, reasoning level, or parallel group:
+
+```bash
+bd show <id> --json | jq '.[0] | {id,title,metadata,description,notes}'
+```
+
+The execution metadata keys are:
+
+- `execution_agent_type`
+- `execution_suggested_model`
+- `execution_reasoning_effort`
+- `execution_mode`
+- `execution_parallel_group`
+
+When these keys are present, treat them as the authoritative execution hints.
+Use `description` for the work scope and `notes` for rationale or fallback
+context. Parent/orchestrator agents must read these fields before spawning
+subagents because a running subagent cannot change its model or reasoning effort
+after launch.
 
 **Use stdin for descriptions with special characters** (backticks, `!`, nested quotes):
 ```bash
@@ -311,11 +344,11 @@ make install
 # Test (local baseline)
 make test
 
-# Test with full CGO-enabled suite (local/CI parity)
-make test-full-cgo
+# Optional ICU regex path smoke (maintainer-only, not normal validation)
+make test-icu-path
 
 # Coverage run
-go test -coverprofile=coverage.out ./...
+go test -tags gms_pure_go -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
 # Verify installed binary
@@ -324,9 +357,12 @@ bd create "Test issue" -p 1
 bd ready
 ```
 
-> **WARNING**: Do NOT use `go build -o bd ./cmd/bd` or `go install ./cmd/bd`.
-> These create stale binaries in the working directory or `~/go/bin/` that
-> shadow the canonical install at `~/.local/bin/bd`. Always use `make install`.
+> **WARNING**: Do NOT use `go build -o bd ./cmd/bd`, `go install ./cmd/bd`,
+> or raw `go run ./cmd/bd ...`.
+> These bypass the canonical build path, can create stale binaries in the
+> working directory or `~/go/bin/`, and raw `go run` may miss the required
+> `gms_pure_go` build tag. Always use `make install`, `./bd`, or
+> `go run -tags gms_pure_go ./cmd/bd ...` when you explicitly need `go run`.
 
 ## Version Management
 
@@ -390,7 +426,7 @@ This handles the entire release workflow automatically, including waiting ~5 min
 
 1. Bump version: `./scripts/bump-version.sh <version> --commit`
 2. Update CHANGELOG.md with release notes
-3. Run tests: `make test` (and `make test-full-cgo` for CGO-related changes)
+3. Run tests: `make test` (and `make test-icu-path` only if you intentionally need the ICU regex path)
 4. Push version bump: `git push origin main`
 5. Tag release: `git tag v<version> && git push origin v<version>`
 6. Update Homebrew: `./scripts/update-homebrew.sh <version>` (waits for GitHub Actions)
@@ -435,13 +471,12 @@ gh issue view 201
 
 - Check existing issues: `bd list`
 - Look at recent commits: `git log --oneline -20`
-- Read the docs: README.md, ADVANCED.md, EXTENDING.md
+- Read the docs: README.md, ADVANCED.md, docs/CONFIG.md
 - Create an issue if unsure: `bd create "Question: ..." -t task -p 2`
 
 ## Important Files
 
 - **README.md** - Main documentation (keep this updated!)
-- **EXTENDING.md** - Database extension guide
 - **ADVANCED.md** - Advanced features (rename, merge, compaction)
 - **CONTRIBUTING.md** - Contribution guidelines
 - **SECURITY.md** - Security policy

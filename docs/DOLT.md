@@ -70,6 +70,18 @@ bd init --server
 export BEADS_DOLT_SERVER_MODE=1
 ```
 
+For externally managed servers, set `BEADS_DOLT_CLI_DIR` when a sync operation
+must fall back to the local Dolt CLI, such as git-protocol remotes or
+credentials/cloud auth that only exist in the current shell:
+
+```bash
+export BEADS_DOLT_CLI_DIR=/path/to/dolt-data/beads
+```
+
+The value must be the actual Dolt database directory where `dolt push` or
+`dolt pull` can run, not the parent server root. Remote types supported by
+SQL `DOLT_PUSH` / `DOLT_PULL` do not need this setting.
+
 ```yaml
 # .beads/config.yaml (server mode settings)
 dolt:
@@ -244,9 +256,10 @@ When someone clones a repository that uses Dolt backend:
 - Clones the Dolt database from the remote (instead of creating a fresh one)
 - Configures the Dolt remote for future `bd dolt push`/`pull`
 
-If `sync.git-remote` is set in `.beads/config.yaml`, that takes precedence
-over auto-detection. `bd init` will warn if it detects `refs/dolt/data` on
-origin and suggest using `bd bootstrap` instead.
+If `sync.remote` is set in `.beads/config.yaml`, that takes precedence
+over auto-detection. Any Dolt-compatible remote URL is supported (DoltHub,
+S3, GCS, file, or git). `bd init` will warn if it detects `refs/dolt/data`
+on origin and suggest using `bd bootstrap` instead.
 
 ### Verifying Bootstrap Worked
 

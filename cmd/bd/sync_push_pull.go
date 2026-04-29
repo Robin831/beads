@@ -168,6 +168,7 @@ func init() {
 	// Linear push/pull
 	linearPushCmd.Flags().Bool("dry-run", false, "Preview push without making changes")
 	linearPullCmd.Flags().Bool("dry-run", false, "Preview pull without making changes")
+	linearPullCmd.Flags().Bool("relations", false, "Import Linear relations as bd dependencies when pulling")
 	linearCmd.AddCommand(linearPushCmd)
 	linearCmd.AddCommand(linearPullCmd)
 
@@ -395,17 +396,23 @@ func runLinearPush(cmd *cobra.Command, args []string) {
 
 	ctx := rootCtx
 	teamIDs := getLinearTeamIDs(ctx, nil)
+	if len(teamIDs) > 1 {
+		FatalError("linear push does not support multiple configured teams\nUse: bd linear sync --push --team <TEAM_ID>")
+	}
 
 	lt := &linear.Tracker{}
 	lt.SetTeamIDs(teamIDs)
 	if err := lt.Init(ctx, store); err != nil {
 		FatalError("initializing Linear tracker: %v", err)
 	}
+	if err := lt.ValidatePushStateMappings(ctx); err != nil {
+		FatalError("%v", err)
+	}
 
 	engine := tracker.NewEngine(lt, store, actor)
 	engine.OnMessage = func(msg string) { fmt.Println("  " + msg) }
 	engine.OnWarning = func(msg string) { fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
-	engine.PushHooks = buildLinearPushHooks(ctx, lt)
+	engine.PushHooks = buildLinearPushHooks(ctx, lt, len(args) > 0)
 
 	result, err := engine.Sync(ctx, tracker.SyncOptions{
 		Push:             true,
@@ -425,6 +432,7 @@ func runLinearPull(cmd *cobra.Command, args []string) {
 		FatalError("at least one bead ID or external reference is required")
 	}
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	relations, _ := cmd.Flags().GetBool("relations")
 	if !dryRun {
 		CheckReadonly("linear pull")
 	}
@@ -451,10 +459,11 @@ func runLinearPull(cmd *cobra.Command, args []string) {
 	engine.PullHooks = buildLinearPullHooks(ctx)
 
 	result, err := engine.Sync(ctx, tracker.SyncOptions{
-		Pull:     true,
-		Push:     false,
-		DryRun:   dryRun,
-		IssueIDs: args,
+		Pull:              true,
+		Push:              false,
+		DryRun:            dryRun,
+		IssueIDs:          args,
+		DependencySources: linearPullDependencySources(relations),
 	})
 	if err != nil {
 		FatalError("sync failed: %v", err)

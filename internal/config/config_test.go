@@ -163,6 +163,51 @@ actor: configuser
 	}
 }
 
+func TestInitialize_IgnoresModuleRootConfigWhenRequested(t *testing.T) {
+	restore := envSnapshot(t)
+	defer restore()
+
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	configDir := filepath.Join(tmpDir, "xdg-config")
+	repoDir := filepath.Join(tmpDir, "repo")
+	beadsDir := filepath.Join(repoDir, ".beads")
+
+	for _, dir := range []string{homeDir, configDir, beadsDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("failed to create %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "go.mod"), []byte("module example.com/test\n\ngo 1.24.0\n"), 0o644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("json: true\nactor: repo-user\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config.yaml: %v", err)
+	}
+
+	t.Setenv("HOME", homeDir)
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
+	t.Chdir(repoDir)
+
+	ResetForTesting()
+	defer ResetForTesting()
+
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	if got := GetBool("json"); got {
+		t.Fatalf("GetBool(json) = %v, want false when repo config is ignored", got)
+	}
+	if got := GetString("actor"); got != "" {
+		t.Fatalf("GetString(actor) = %q, want empty default when repo config is ignored", got)
+	}
+	if got := ConfigFileUsed(); got != "" {
+		t.Fatalf("ConfigFileUsed() = %q, want empty when repo config is ignored", got)
+	}
+}
+
 func TestLocalConfigOverride(t *testing.T) {
 	// Isolate from environment variables
 	restore := envSnapshot(t)
@@ -1368,4 +1413,163 @@ func TestGetStringFromDir(t *testing.T) {
 			t.Errorf("got %q, want %q", got, "alice")
 		}
 	})
+}
+
+// TestXDGConfigPath_Loaded verifies that ~/.config/bd/config.yaml is loaded
+// when it exists, even if os.UserConfigDir() returns a different path (macOS).
+func TestXDGConfigPath_Loaded(t *testing.T) {
+	restore := envSnapshot(t)
+	defer restore()
+
+	// Clear env vars that could interfere with config defaults
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome) // Windows
+
+	// Create ~/.config/bd/config.yaml with a distinctive value
+	xdgConfigDir := filepath.Join(tmpHome, ".config", "bd")
+	if err := os.MkdirAll(xdgConfigDir, 0o755); err != nil {
+		t.Fatalf("failed to create xdg config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(xdgConfigDir, "config.yaml"),
+		[]byte("actor: xdg-test-user\n"), 0o600); err != nil {
+		t.Fatalf("failed to write xdg config: %v", err)
+	}
+
+	// Set XDG_CONFIG_HOME to a DIFFERENT directory so os.UserConfigDir()
+	// won't return ~/.config (simulates macOS behavior).
+	altConfigDir := filepath.Join(tmpHome, "Library", "Application Support")
+	if err := os.MkdirAll(altConfigDir, 0o755); err != nil {
+		t.Fatalf("failed to create alt config dir: %v", err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", altConfigDir)
+
+	// CWD should be somewhere with no .beads/
+	t.Chdir(tmpHome)
+
+	ResetForTesting()
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize() returned error: %v", err)
+	}
+
+	if got := GetString("actor"); got != "xdg-test-user" {
+		t.Errorf("GetString(actor) = %q, want %q (from ~/.config/bd/config.yaml)", got, "xdg-test-user")
+	}
+}
+
+// TestXDGConfigPath_Dedup verifies that when os.UserConfigDir() already returns
+// ~/.config, the path is not added twice.
+func TestXDGConfigPath_Dedup(t *testing.T) {
+	restore := envSnapshot(t)
+	defer restore()
+
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+
+	// Make XDG_CONFIG_HOME point to ~/.config so os.UserConfigDir() returns it
+	dotConfig := filepath.Join(tmpHome, ".config")
+	t.Setenv("XDG_CONFIG_HOME", dotConfig)
+
+	// Create the config file
+	xdgConfigDir := filepath.Join(dotConfig, "bd")
+	if err := os.MkdirAll(xdgConfigDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(xdgConfigDir, "config.yaml"),
+		[]byte("actor: dedup-user\n"), 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	t.Chdir(tmpHome)
+
+	ResetForTesting()
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize() returned error: %v", err)
+	}
+
+	// The config should load exactly once (no error from duplicate merge)
+	if got := GetString("actor"); got != "dedup-user" {
+		t.Errorf("GetString(actor) = %q, want %q", got, "dedup-user")
+	}
+}
+
+// TestXDGConfigPath_Missing verifies that when ~/.config/bd/config.yaml does
+// not exist, no error occurs.
+func TestXDGConfigPath_Missing(t *testing.T) {
+	restore := envSnapshot(t)
+	defer restore()
+
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpHome, "xdg-config"))
+
+	t.Chdir(tmpHome)
+
+	ResetForTesting()
+	err := Initialize()
+	if err != nil {
+		t.Fatalf("Initialize() returned error when ~/.config/bd/config.yaml missing: %v", err)
+	}
+
+	// Should still have defaults
+	if got := GetString("actor"); got != "" {
+		t.Errorf("GetString(actor) = %q, want empty (default)", got)
+	}
+}
+
+func TestInitialize_ExternalBEADSDirDoesNotMergeCallerProjectConfig(t *testing.T) {
+	restore := envSnapshot(t)
+	defer restore()
+
+	callerRepo := filepath.Join(t.TempDir(), "caller")
+	callerBeadsDir := filepath.Join(callerRepo, ".beads")
+	if err := os.MkdirAll(callerBeadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create caller .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(callerBeadsDir, "config.yaml"), []byte("readonly: true\njson: true\n"), 0o600); err != nil {
+		t.Fatalf("failed to write caller config: %v", err)
+	}
+
+	targetBeadsDir := filepath.Join(t.TempDir(), "target", ".beads")
+	if err := os.MkdirAll(targetBeadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create target .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetBeadsDir, "config.yaml"), []byte("actor: target-user\n"), 0o600); err != nil {
+		t.Fatalf("failed to write target config: %v", err)
+	}
+
+	t.Chdir(callerRepo)
+	t.Setenv("BEADS_DIR", targetBeadsDir)
+
+	ResetForTesting()
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize() returned error: %v", err)
+	}
+
+	if got := GetString("actor"); got != "target-user" {
+		t.Fatalf("GetString(actor) = %q, want %q", got, "target-user")
+	}
+	if got := GetBool("readonly"); got {
+		t.Fatalf("GetBool(readonly) = %v, want false", got)
+	}
+	if got := GetBool("json"); got {
+		t.Fatalf("GetBool(json) = %v, want false", got)
+	}
 }

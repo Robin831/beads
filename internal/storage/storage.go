@@ -18,6 +18,11 @@ import (
 // claimed by another user. The error message contains the current assignee.
 var ErrAlreadyClaimed = errors.New("issue already claimed")
 
+// ErrNotClaimable is returned when attempting to claim an issue that is not in a
+// claimable state, such as closed, deferred, or already in progress without the
+// same actor owning the claim.
+var ErrNotClaimable = errors.New("issue not claimable")
+
 // ErrNotFound is returned when a requested entity does not exist in the database.
 var ErrNotFound = errors.New("not found")
 
@@ -83,6 +88,12 @@ type Storage interface {
 	SetConfig(ctx context.Context, key, value string) error
 	GetConfig(ctx context.Context, key string) (string, error)
 	GetAllConfig(ctx context.Context) (map[string]string, error)
+
+	// Local metadata operations (dolt-ignored, clone-local state).
+	// Used for tip timestamps, version stamps, tracker sync cursors, etc.
+	// Data is ephemeral — callers must handle ("", nil) as the normal case.
+	SetLocalMetadata(ctx context.Context, key, value string) error
+	GetLocalMetadata(ctx context.Context, key string) (string, error)
 
 	// Transactions
 	RunInTransaction(ctx context.Context, commitMsg string, fn func(tx Transaction) error) error
@@ -249,6 +260,7 @@ type Transaction interface {
 
 	// Dependency operations
 	AddDependency(ctx context.Context, dep *types.Dependency, actor string) error
+	AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, opts DependencyAddOptions) error
 	RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error
 	GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error)
 
@@ -265,8 +277,21 @@ type Transaction interface {
 	SetMetadata(ctx context.Context, key, value string) error
 	GetMetadata(ctx context.Context, key string) (string, error)
 
+	// Local metadata operations (dolt-ignored, clone-local state).
+	// Used for tip timestamps, version stamps, tracker sync cursors, etc.
+	// Data is ephemeral — callers must handle ("", nil) as the normal case.
+	SetLocalMetadata(ctx context.Context, key, value string) error
+	GetLocalMetadata(ctx context.Context, key string) (string, error)
+
 	// Comment operations
 	AddComment(ctx context.Context, issueID, actor, comment string) error
 	ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error)
 	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
+}
+
+// DependencyAddOptions controls transaction-scoped dependency insertion.
+type DependencyAddOptions struct {
+	// SkipCycleCheck bypasses the recursive pre-insert cycle check. This is
+	// intended for bulk wiring paths that perform a final graph check separately.
+	SkipCycleCheck bool
 }

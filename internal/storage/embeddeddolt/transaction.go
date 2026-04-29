@@ -93,8 +93,15 @@ func (t *embeddedTransaction) SearchIssues(ctx context.Context, query string, fi
 }
 
 func (t *embeddedTransaction) AddDependency(ctx context.Context, dep *types.Dependency, actor string) error {
+	return t.AddDependencyWithOptions(ctx, dep, actor, storage.DependencyAddOptions{})
+}
+
+func (t *embeddedTransaction) AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, addOpts storage.DependencyAddOptions) error {
 	t.dirty.MarkDirty("dependencies")
-	return issueops.AddDependencyInTx(ctx, t.tx, dep, actor, issueops.AddDependencyOpts{})
+	return issueops.AddDependencyInTx(ctx, t.tx, dep, actor, issueops.AddDependencyOpts{
+		IsCrossPrefix:  types.ExtractPrefix(dep.IssueID) != types.ExtractPrefix(dep.DependsOnID),
+		SkipCycleCheck: addOpts.SkipCycleCheck,
+	})
 }
 
 func (t *embeddedTransaction) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
@@ -156,6 +163,14 @@ func (t *embeddedTransaction) SetMetadata(ctx context.Context, key, value string
 
 func (t *embeddedTransaction) GetMetadata(ctx context.Context, key string) (string, error) {
 	return issueops.GetMetadataInTx(ctx, t.tx, key)
+}
+
+func (t *embeddedTransaction) SetLocalMetadata(ctx context.Context, key, value string) error {
+	return issueops.SetLocalMetadataInTx(ctx, t.tx, key, value)
+}
+
+func (t *embeddedTransaction) GetLocalMetadata(ctx context.Context, key string) (string, error) {
+	return issueops.GetLocalMetadataInTx(ctx, t.tx, key)
 }
 
 func (t *embeddedTransaction) AddComment(ctx context.Context, issueID, actor, comment string) error {

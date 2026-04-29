@@ -13,14 +13,26 @@ import (
 // dolt_ignore entries are committed and persist across branches; only the
 // tables themselves (which live in the working set) need recreation.
 func EnsureIgnoredTables(ctx context.Context, db DBConn) error {
-	exists, err := TableExists(ctx, db, "wisps")
-	if err != nil {
-		return fmt.Errorf("check wisps table: %w", err)
+	for _, table := range ignoredTableNames {
+		ok, err := TableExists(ctx, db, table)
+		if err != nil {
+			return fmt.Errorf("check %s table: %w", table, err)
+		}
+		if !ok {
+			return CreateIgnoredTables(ctx, db)
+		}
 	}
-	if exists {
-		return nil
-	}
-	return CreateIgnoredTables(ctx, db)
+	return nil
+}
+
+var ignoredTableNames = []string{
+	"local_metadata",
+	"repo_mtimes",
+	"wisps",
+	"wisp_labels",
+	"wisp_dependencies",
+	"wisp_events",
+	"wisp_comments",
 }
 
 // CreateIgnoredTables unconditionally creates all dolt_ignore'd tables
@@ -30,9 +42,15 @@ func EnsureIgnoredTables(ctx context.Context, db DBConn) error {
 // This does NOT set up dolt_ignore entries or commit — those are migration
 // concerns handled separately during bd init.
 func CreateIgnoredTables(ctx context.Context, db DBConn) error {
-	for _, ddl := range IgnoredTableDDL {
+	for _, ddl := range IgnoredTableDDL() {
 		if _, err := db.ExecContext(ctx, ddl); err != nil {
-			return fmt.Errorf("create ignored table: %w", err)
+			// Tolerate "already exists" / "duplicate column" errors: when
+			// wisps exists but local_metadata doesn't (or vice versa), the
+			// ALTER TABLE statements for existing tables may hit columns
+			// that are already present.
+			if !isConcurrentInitError(err) {
+				return fmt.Errorf("create ignored table: %w", err)
+			}
 		}
 	}
 	return nil

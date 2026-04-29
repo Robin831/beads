@@ -11,6 +11,20 @@ This file exists for compatibility with tools that look for AGENTS.md.
 - **Visual Design System** - Status icons, colors, and semantic styling for CLI output
 - **Contributor Protection** - Read [CONTRIBUTING.md](CONTRIBUTING.md) before handling external PRs
 
+## PR Safety for Agents
+
+Before implementing work, opening a PR, or merging/closing a PR, run the PR
+preflight:
+```bash
+scripts/pr-preflight.sh --search "<topic keywords>" --repo gastownhall/beads
+scripts/pr-preflight.sh <pr-number> --repo gastownhall/beads
+```
+
+External contributor PRs have priority. Review and build on their branch when
+possible, preserve their tests and attribution, and never close or supersede
+their PR silently. If a rewrite is unavoidable, explain why on the original PR
+and credit their design/tests.
+
 ## Visual Design Anti-Patterns
 
 **NEVER use emoji-style icons** (🔴🟠🟡🔵⚪) in CLI output. They cause cognitive overload.
@@ -41,12 +55,12 @@ echo 'Updated text' | bd update <id> --description=-
 ## Testing Commands (No Ambiguity)
 
 - Default local test command: `make test` (or `./scripts/test.sh`).
-- Full CGO-enabled suite: `make test-full-cgo` (or `./scripts/test-cgo.sh ./...`).
-- On macOS, do **not** run raw `CGO_ENABLED=1 go test ./...` unless ICU flags are set; use the script/Make target above.
-- If you need package- or test-scoped CGO runs:
+- Opt-in ICU regex path: `make test-icu-path` (or `./scripts/test-icu-path.sh ./...`).
+- This ICU path is maintainer-only and not part of normal validation; `make test-full-cgo` and `./scripts/test-cgo.sh` are deprecated aliases.
+- For package- or test-scoped shipped-config CGO runs, prefer:
 ```bash
-./scripts/test-cgo.sh ./cmd/bd/...
-./scripts/test-cgo.sh -run '^TestName$' ./cmd/bd/...
+CGO_ENABLED=1 go test -tags gms_pure_go ./cmd/bd/...
+CGO_ENABLED=1 go test -tags gms_pure_go -run '^TestName$' ./cmd/bd/...
 ```
 
 ## Non-Interactive Shell Commands
@@ -160,11 +174,16 @@ bd close bd-42 --reason "Completed" --json
 ### Workflow for AI Agents
 
 1. **Check ready work**: `bd ready` shows unblocked issues
-2. **Claim your task atomically**: `bd update <id> --claim`
-3. **Work on it**: Implement, test, document
-4. **Discover new work?** Create linked issue:
+2. **Read execution metadata first**: before deciding local vs delegated work, model, or reasoning level, inspect structured metadata:
+   ```bash
+   bd show <id> --json | jq '.[0] | {id,title,metadata,description,notes}'
+   ```
+   The execution metadata keys `execution_agent_type`, `execution_suggested_model`, `execution_reasoning_effort`, `execution_mode`, and `execution_parallel_group` are authoritative hints when present. Use description and notes as fallback context.
+3. **Claim your task atomically**: `bd update <id> --claim`
+4. **Work on it**: Implement, test, document
+5. **Discover new work?** Create linked issue:
    - `bd create "Found bug" --description="Details about what was found" -p 1 --deps discovered-from:<parent-id>`
-5. **Complete**: `bd close <id> --reason "Done"`
+6. **Complete**: `bd close <id> --reason "Done"`
 
 ### Auto-Sync
 

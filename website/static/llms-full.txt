@@ -30,7 +30,7 @@ Traditional issue trackers (Jira, GitHub Issues) weren't designed for AI agents.
 brew install beads
 
 # Or quick install (macOS/Linux/FreeBSD)
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 
 # Initialize in your project
 cd your-project
@@ -112,7 +112,7 @@ bd setup claude
 
 This installs:
 - **SessionStart hook** - Runs `bd prime` when Claude Code starts
-- **PreCompact hook** - Ensures `bd dolt push` before context compaction
+- **PreCompact hook** - Runs `bd prime` before context compaction
 
 **How it works:**
 1. SessionStart hook runs `bd prime` automatically
@@ -133,7 +133,7 @@ If you prefer manual configuration, add to your Claude Code hooks:
 {
   "hooks": {
     "SessionStart": ["bd prime"],
-    "PreCompact": ["bd dolt push"]
+    "PreCompact": ["bd prime"]
   }
 }
 ```
@@ -322,39 +322,25 @@ brew install beads
 ### Quick Install Script (All Platforms)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
 The installer will:
 - Detect your platform (macOS/Linux/FreeBSD, amd64/arm64)
-- Install via `go install` if Go is available
+- Fall back to the supported `go install` modes if Go is available
 - Fall back to building from source if needed
 - Guide you through PATH setup if necessary
 
-## Build Dependencies (go install / from source)
+## Go Install and Build Dependencies
 
-If you install via `go install` or build from source, you need system dependencies for CGO:
+Use Homebrew, npm, or the install script if you do not specifically need `go install`.
 
-macOS (Homebrew):
-```bash
-brew install icu4c zstd
-```
+`go install` has two supported modes:
 
-Linux (Debian/Ubuntu):
-```bash
-sudo apt-get install -y libicu-dev libzstd-dev
-```
+- **Server-mode only:** `CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest`
+- **Embedded-capable:** `CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest`
 
-Linux (Fedora/RHEL):
-```bash
-sudo dnf install -y libicu-devel libzstd-devel
-```
-
-If you see `unicode/uregex.h` missing on macOS, `icu4c` is keg-only. Use:
-```bash
-ICU_PREFIX="$(brew --prefix icu4c)"
-CGO_CFLAGS="-I${ICU_PREFIX}/include" CGO_CPPFLAGS="-I${ICU_PREFIX}/include" CGO_LDFLAGS="-L${ICU_PREFIX}/lib" go install github.com/steveyegge/beads/cmd/bd@latest
-```
+ICU headers are not required. The embedded-capable command uses `gms_pure_go` so go-mysql-server uses Go's stdlib regexp instead of ICU.
 
 ## Platform-Specific Installation
 
@@ -365,16 +351,21 @@ CGO_CFLAGS="-I${ICU_PREFIX}/include" CGO_CPPFLAGS="-I${ICU_PREFIX}/include" CGO_
 brew install beads
 ```
 
-**Via go install**:
+**Via go install** (server-mode only):
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
+**Via go install** (embedded-capable):
+```bash
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 **From source**:
 ```bash
-git clone https://github.com/steveyegge/beads
+git clone https://github.com/gastownhall/beads
 cd beads
-go build -o bd ./cmd/bd
+make build
 sudo mv bd /usr/local/bin/
 ```
 
@@ -393,21 +384,26 @@ yay -S beads-git
 paru -S beads-git
 ```
 
-**Via go install**:
+**Via go install** (server-mode only):
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
+**Via go install** (embedded-capable):
+```bash
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### FreeBSD
 
 **Via quick install script**:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
-**Via go install**:
+**Via go install** (server-mode only):
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### Windows 11
@@ -420,17 +416,20 @@ Beads ships with native Windows support—no MSYS or MinGW required.
 
 **Via PowerShell script**:
 ```pwsh
-irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex
 ```
 
 The script installs a prebuilt Windows release if available. Go is only required for `go install` or building from source.
 
-**Via go install**:
+**Via go install** (server-mode only):
 ```pwsh
-go install github.com/steveyegge/beads/cmd/bd@latest
+$env:CGO_ENABLED="0"; go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
-If you see `unicode/uregex.h` missing while building, use the PowerShell install script instead.
+**Via go install** (embedded-capable):
+```pwsh
+$env:CGO_ENABLED="1"; $env:GOFLAGS="-tags=gms_pure_go"; go install github.com/steveyegge/beads/cmd/bd@latest
+```
 
 ## IDE and Editor Integrations
 
@@ -510,6 +509,9 @@ go list -f {{.Target}} github.com/steveyegge/beads/cmd/bd
 
 # Add Go bin to PATH (add to ~/.bashrc or ~/.zshrc)
 export PATH="$PATH:$(go env GOPATH)/bin"
+
+# Or reinstall with the recommended installer
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
 ### `zsh: killed bd` or crashes on macOS
@@ -517,8 +519,8 @@ export PATH="$PATH:$(go env GOPATH)/bin"
 This is typically caused by CGO/SQLite compatibility issues:
 
 ```bash
-# Build with CGO enabled
-CGO_ENABLED=1 go install github.com/steveyegge/beads/cmd/bd@latest
+# Install an embedded-capable build
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ## Updating bd
@@ -526,13 +528,13 @@ CGO_ENABLED=1 go install github.com/steveyegge/beads/cmd/bd@latest
 ### Quick install script (macOS/Linux/FreeBSD)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
 ### PowerShell installer (Windows)
 
 ```pwsh
-irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex
 ```
 
 ### Homebrew
@@ -544,7 +546,11 @@ brew upgrade beads
 ### go install
 
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+# Server-mode only
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+
+# Embedded-capable
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 For post-upgrade steps (hooks, migrations), see [Upgrading](/getting-started/upgrading).
@@ -824,7 +830,7 @@ bd dolt pull
 
 When a teammate clones the repo, `bd bootstrap` auto-detects the existing database on `refs/dolt/data` and clones it — no manual remote setup needed.
 
-See [Sync](/cli-reference/sync) for CLI details. For remote configuration and federation, see the repository docs [DOLT-BACKEND.md](https://github.com/steveyegge/beads/blob/main/docs/DOLT-BACKEND.md) and [FEDERATION-SETUP.md](https://github.com/steveyegge/beads/blob/main/FEDERATION-SETUP.md).
+See [Sync](/cli-reference/sync) for CLI details. For remote configuration and federation, see the repository docs [DOLT-BACKEND.md](https://github.com/gastownhall/beads/blob/main/docs/DOLT-BACKEND.md) and [FEDERATION-SETUP.md](https://github.com/gastownhall/beads/blob/main/FEDERATION-SETUP.md).
 
 ## Optional: Notion sync
 
@@ -925,7 +931,7 @@ bd admin cleanup --force
 - More sync scenarios: [Sync](/cli-reference/sync)
 - Full command list: [CLI Reference](/cli-reference)
 
-See the [repository README](https://github.com/steveyegge/beads/blob/main/README.md) for an overview and links to deeper docs.
+See the [repository README](https://github.com/gastownhall/beads/blob/main/README.md) for an overview and links to deeper docs.
 
 </document>
 
@@ -953,24 +959,25 @@ Use the command that matches your install method.
 
 | Install method | Platforms | Command |
 |---|---|---|
-| Quick install script | macOS, Linux, FreeBSD | `curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh \| bash` |
-| PowerShell installer | Windows | `irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 \| iex` |
+| Quick install script | macOS, Linux, FreeBSD | `curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh \| bash` |
+| PowerShell installer | Windows | `irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 \| iex` |
 | Homebrew | macOS, Linux | `brew upgrade beads` |
-| go install | macOS, Linux, FreeBSD, Windows | `go install github.com/steveyegge/beads/cmd/bd@latest` |
+| go install (server-mode only) | macOS, Linux, FreeBSD, Windows | `CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest` |
+| go install (embedded-capable) | macOS, Linux, Windows | `CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest` |
 | npm | macOS, Linux, Windows | `npm update -g @beads/bd` |
 | bun | macOS, Linux, Windows | `bun install -g --trust @beads/bd` |
-| From source (Unix shell) | macOS, Linux, FreeBSD | `git pull && go build -o bd ./cmd/bd` |
+| From source (Unix shell) | macOS, Linux, FreeBSD | `git pull && make build` |
 
 ### Quick install script (macOS/Linux/FreeBSD)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
 ### PowerShell installer (Windows)
 
 ```pwsh
-irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex
 ```
 
 ### Homebrew
@@ -982,7 +989,11 @@ brew upgrade beads
 ### go install
 
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+# Server-mode only
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+
+# Embedded-capable
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### From Source
@@ -990,7 +1001,7 @@ go install github.com/steveyegge/beads/cmd/bd@latest
 ```bash
 cd beads
 git pull
-go build -o bd ./cmd/bd
+make build
 sudo mv bd /usr/local/bin/
 ```
 
@@ -1134,8 +1145,8 @@ Declarative workflow templates:
 ## Navigation
 
 - [Issues & Dependencies](/core-concepts/issues)
-- [Dolt Server Mode](/core-concepts/dolt-server)
-- [Dolt Sync](/core-concepts/dolt-sync)
+- [Dolt Server Mode](#dolt-server-mode)
+- [Dolt Sync](#dolt-sync)
 - [Hash-based IDs](/core-concepts/hash-ids)
 
 </document>
@@ -1465,7 +1476,7 @@ Beads uses **Dolt** as its sole storage backend -- a version-controlled SQL data
 
 By default, Dolt runs in **embedded mode** (in-process, no separate server). For multi-writer
 setups (multiple agents, orchestrator), switch to **server mode** which connects to a
-running `dolt sql-server`. See [DOLT.md](/docs/DOLT.md) for details.
+running `dolt sql-server`. See the [Dolt Server Mode](#dolt-server-mode) section below for details.
 
 ```mermaid
 flowchart TD
@@ -2868,19 +2879,19 @@ Beads provides powerful workflow primitives for complex, multi-step processes.
 
 ## Chemistry Metaphor
 
-Beads uses a molecular chemistry metaphor:
+Beads uses a molecular chemistry metaphor for workflow phases:
 
-| Phase | Storage | Synced | Use Case |
+| Phase | Command | Synced | Use Case |
 |-------|---------|--------|----------|
-| **Proto** (solid) | Built-in | N/A | Reusable templates |
-| **Mol** (liquid) | `.beads/` | Yes | Persistent work |
-| **Wisp** (vapor) | `.beads-wisp/` | No | Ephemeral operations |
+| **Proto** (solid) | `bd cook` | N/A | Compiled template, reusable |
+| **Mol** (liquid) | `bd mol pour` | Yes | Persistent work with audit trail |
+| **Wisp** (vapor) | `bd mol wisp` | No | Ephemeral operations |
 
 ## Core Concepts
 
 ### Formulas
 
-Declarative workflow templates in TOML or JSON:
+Declarative workflow templates in TOML or JSON. Support variables, conditional steps, loops, inheritance, and composition.
 
 ```toml
 formula = "feature-workflow"
@@ -2898,10 +2909,14 @@ title = "Implement the feature"
 needs = ["design"]
 ```
 
+### Cooking
+
+`bd cook` compiles a formula into a resolved proto. Two modes: compile-time (keeps `{{var}}` placeholders for planning) and runtime (substitutes all variables for final output).
+
 ### Molecules
 
 Work graphs with parent-child relationships:
-- Created by instantiating formulas with `bd pour`
+- Created by instantiating formulas with `bd mol pour`
 - Steps have dependencies (`needs`)
 - Progress tracked via issue status
 
@@ -2914,42 +2929,57 @@ Async coordination primitives:
 
 ### Wisps
 
-Ephemeral operations that don't sync to git:
-- Created with `bd wisp`
-- Stored in `.beads-wisp/` (gitignored)
-- Auto-expire after completion
+Ephemeral operations that don't sync:
+- Created with `bd mol wisp`
+- Stored locally with `Ephemeral=true`
+- Lifecycle: squash (promote), burn (discard), or GC (auto-clean)
+
+### Swarms
+
+Parallel execution across an epic's dependency graph:
+- Analyze epic structure for parallelism: `bd swarm validate`
+- Create coordinated swarm from epic: `bd swarm create`
+- Monitor progress across waves: `bd swarm status`
 
 ## Workflow Commands
 
 | Command | Description |
 |---------|-------------|
-| `bd pour` | Instantiate formula as molecule |
-| `bd wisp` | Create ephemeral wisp |
+| `bd cook` | Compile formula into proto |
+| `bd mol pour` | Instantiate formula as persistent molecule |
+| `bd mol wisp` | Create ephemeral wisp from formula |
 | `bd mol list` | List molecules |
-| `bd pin` | Pin work to agent |
-| `bd hook` | Show pinned work |
+| `bd mol squash` | Promote wisp to persistent molecule |
+| `bd mol burn` | Delete wisp without trace |
+| `bd mol wisp gc` | Garbage collect old wisps |
+| `bd mol bond` | Bond formulas together with phase control |
+| `bd swarm validate` | Analyze epic for parallel execution |
+| `bd swarm create` | Create swarm from epic |
+| `bd swarm status` | Show swarm progress |
+| `bd swarm list` | List all swarm molecules |
+| `bd formula list` | List available formulas |
 
 ## Simple Example
 
 ```bash
 # Create a release workflow
-bd pour release --var version=1.0.0
+bd mol pour release --var version=1.0.0
 
 # View the molecule
-bd mol show release-1.0.0
+bd dep tree bd-xyz
 
 # Work through steps
-bd update release-1.0.0.1 --claim
-bd close release-1.0.0.1
+bd update bd-xyz.1 --claim
+bd close bd-xyz.1
 # Next step becomes ready...
 ```
 
 ## Navigation
 
 - [Molecules](/workflows/molecules) - Work graphs and execution
-- [Formulas](/workflows/formulas) - Declarative templates
+- [Formulas](/workflows/formulas) - Declarative templates (types, variables, inheritance, loops, conditions)
 - [Gates](/workflows/gates) - Async coordination
-- [Wisps](/workflows/wisps) - Ephemeral operations
+- [Wisps](/workflows/wisps) - Ephemeral operations (squash, burn, GC lifecycle)
 
 </document>
 
@@ -3035,6 +3065,32 @@ needs = ["review"]
 | `workflow` | Standard step sequence |
 | `expansion` | Template for expansion operator |
 | `aspect` | Cross-cutting concerns |
+| `convoy` | Multi-agent coordination (parallel workers) |
+
+### Convoy Formulas
+
+Convoy formulas coordinate multiple agents working in parallel. Use them for code review with multiple reviewers, design review sessions, or any workflow requiring parallel human or agent coordination.
+
+```toml
+formula = "multi-reviewer"
+description = "Parallel code review with multiple reviewers"
+version = 1
+type = "convoy"
+
+[vars.reviewers]
+description = "Comma-separated reviewer names"
+required = true
+
+[[steps]]
+id = "review-setup"
+title = "Prepare review artifacts"
+
+[[steps]]
+id = "collect"
+title = "Collect reviews"
+needs = ["review-setup"]
+waits_for = "all-children"
+```
 
 ## Variables
 
@@ -3099,6 +3155,159 @@ title = "Deploy"
 needs = ["test-unit", "test-integration"]  # Waits for both
 ```
 
+## Conditional Steps
+
+Steps can be made conditional based on a variable:
+
+```toml
+[vars.run_security_scan]
+description = "Whether to run security scan"
+default = "true"
+
+[[steps]]
+id = "security-scan"
+title = "Run security scan"
+condition = "{{run_security_scan}}"
+
+[[steps]]
+id = "deploy"
+title = "Deploy to production"
+condition = "{{environment}} == production"
+```
+
+Condition formats:
+- `"{{var}}"` - truthy (non-empty, non-false)
+- `"!{{var}}"` - negated
+- `"{{var}} == value"` - equality
+- `"{{var}} != value"` - inequality
+
+Conditions are evaluated at cook/pour time. Steps that don't match are removed from the workflow.
+
+## Loops and Iteration
+
+Steps can iterate using the `loop` field:
+
+### Fixed Count
+
+```toml
+[[steps]]
+id = "retry"
+title = "Attempt {{i}}"
+
+[steps.loop]
+count = 3
+var = "i"
+
+[[steps.loop.body]]
+id = "try-{{i}}"
+title = "Attempt {{i}}"
+```
+
+### Range
+
+```toml
+[[steps]]
+id = "phases"
+title = "Phase iteration"
+
+[steps.loop]
+range = "1..5"
+var = "phase_num"
+
+[[steps.loop.body]]
+id = "phase-{{phase_num}}"
+title = "Execute phase {{phase_num}}"
+```
+
+Range supports expressions: `"1..2^{disks}"`, `"{start}..{count}"`.
+
+### Until (Conditional)
+
+```toml
+[steps.loop]
+until = "step.status == 'complete'"
+max = 10
+var = "attempt"
+
+[[steps.loop.body]]
+id = "attempt-{{attempt}}"
+title = "Attempt {{attempt}}"
+```
+
+The `max` field is required for `until` loops to prevent unbounded iteration.
+
+## Runtime Expansion (on_complete)
+
+Steps can trigger dynamic work when they complete using `on_complete` with `for_each`:
+
+```toml
+[[steps]]
+id = "survey"
+title = "Survey available workers"
+
+[steps.on_complete]
+for_each = "output.workers"
+bond = "worker-arm"
+parallel = true
+
+[steps.on_complete.vars]
+worker_name = "{item.name}"
+rig = "{item.rig}"
+```
+
+This creates a new molecule from the `worker-arm` formula for each item in the `output.workers` array. Use `sequential = true` instead of `parallel` to run them one at a time.
+
+## Formula Inheritance
+
+Formulas can inherit from parent formulas using `extends`:
+
+```toml
+formula = "secure-release"
+description = "Release with security audit"
+version = 1
+type = "workflow"
+extends = ["release"]
+
+# Inherits all vars and steps from "release"
+# Add new steps or override existing ones by ID:
+[[steps]]
+id = "security-audit"
+title = "Security audit"
+needs = ["test"]
+
+# Override parent step
+[[steps]]
+id = "publish"
+title = "Publish release (with audit)"
+needs = ["tag", "security-audit"]
+```
+
+Child formulas inherit all vars, steps, and compose rules from parents. Child definitions with the same ID override parent definitions.
+
+## Cooking Formulas
+
+`bd cook` compiles a formula into a resolved proto. Two modes:
+
+### Compile-time (default)
+
+Produces a proto with `{{variable}}` placeholders intact. Useful for modeling, estimation, and planning.
+
+```bash
+bd cook feature-workflow                    # Template with placeholders
+bd cook feature-workflow --dry-run          # Preview steps
+```
+
+### Runtime
+
+Produces a fully-resolved proto with variables substituted. Requires all variables to have values.
+
+```bash
+bd cook feature-workflow --var feature_name=auth      # Substitute vars
+bd cook feature-workflow --mode=runtime --var name=x  # Explicit runtime
+```
+
+For most workflows, prefer using `bd pour` or `bd mol wisp` directly - they cook the formula inline.
+
 ## Gates
 
 Add gates for async coordination:
@@ -3119,6 +3328,8 @@ title = "Deploy to production"
 needs = ["approval"]
 ```
 
+Gate types: `human`, `timer`, `gh:run` (GitHub Actions), `gh:pr` (pull request).
+
 ## Aspects (Cross-cutting)
 
 Apply transformations to matching steps:
@@ -3135,31 +3346,43 @@ id = "security-scan-{step.id}"
 title = "Security scan before {step.title}"
 ```
 
+Aspects support `before`, `after`, and `around` advice. Apply aspects to a formula via `compose.aspects`:
+
+```toml
+[compose]
+aspects = ["security-scan", "logging"]
+```
+
 ## Formula Locations
 
 Formulas are searched in order:
 1. `.beads/formulas/` (project-level)
 2. `~/.beads/formulas/` (user-level)
-3. Built-in formulas
 
 ## Using Formulas
 
 ```bash
 # List available formulas
-bd mol list
+bd formula list
 
-# Pour formula into molecule
-bd pour <formula-name> --var key=value
+# Cook (compile) a formula
+bd cook <formula-name> [--var key=value]
+
+# Pour formula into molecule (persistent)
+bd mol pour <formula-name> --var key=value
+
+# Create wisp from formula (ephemeral)
+bd mol wisp <formula-name> --var key=value
 
 # Preview what would be created
-bd pour <formula-name> --dry-run
+bd mol pour <formula-name> --dry-run
 ```
 
 ## Creating Custom Formulas
 
 1. Create file: `.beads/formulas/my-workflow.formula.toml`
 2. Define structure (see examples above)
-3. Use with: `bd pour my-workflow`
+3. Use with: `bd mol pour my-workflow`
 
 ## Example: Release Formula
 
@@ -3596,60 +3819,100 @@ Wisps are ephemeral workflows that don't sync to git.
 
 ## What are Wisps?
 
-Wisps are "vapor phase" molecules:
-- Stored in `.beads-wisp/` (gitignored)
-- Don't sync with git
-- Auto-expire after completion
-- Perfect for temporary operations
+Wisps are "vapor phase" molecules - issues stored with `Ephemeral=true` in the main database. They are local-only and not synced via Dolt push/pull.
 
 ## Use Cases
 
 | Scenario | Why Wisp? |
 |----------|-----------|
-| Local experiments | No need to pollute git history |
-| CI/CD pipelines | Ephemeral by nature |
-| Scratch workflows | Quick throwaway work |
-| Agent coordination | Local-only coordination |
+| Release workflows | One-time execution, no audit trail needed |
+| Operational loops | Recurring cycles that auto-clean up |
+| Health checks | Diagnostics that shouldn't clutter history |
+| Local experiments | Quick throwaway work |
+| Agent coordination | Local-only parallel coordination |
 
 ## Creating Wisps
 
 ```bash
 # Create wisp from formula
-bd wisp create <formula> [--var key=value]
+bd mol wisp <formula> [--var key=value]
 
-# Example
-bd wisp create quick-check --var target=auth-module
+# Examples
+bd mol wisp quick-check
+bd mol wisp release --var version=1.0.0
 ```
+
+Formulas can recommend wisp usage with `phase = "vapor"` in the formula definition. If you use `bd mol pour` on a vapor-phase formula, you'll get a warning suggesting `bd mol wisp` instead.
+
+## Wisp Lifecycle
+
+```
+Formula (template)
+    | bd mol wisp
+    v
+Wisp (ephemeral, Ephemeral=true)
+    | normal bd operations
+    v
+Completed Wisp
+    |
+    +---> bd mol squash  (promote to persistent molecule)
+    +---> bd mol burn    (delete without trace)
+    +---> bd mol wisp gc (garbage collect old wisps)
+```
+
+### Squash (Promote to Persistent)
+
+Convert a wisp into a regular persistent molecule. Clears the `Ephemeral` flag so the issue syncs to git. Use when ephemeral work turns out to be worth preserving.
+
+```bash
+bd mol squash <wisp-id>
+```
+
+### Burn (Delete Without Trace)
+
+Delete a wisp and all its children without creating a digest or summary. Use for discarding failed or abandoned ephemeral work.
+
+```bash
+bd mol burn <wisp-id>
+```
+
+### Garbage Collection
+
+Clean up old, orphaned, or completed wisps automatically:
+
+```bash
+# List all wisps (flags old ones > 24h)
+bd mol wisp list
+
+# Garbage collect orphaned wisps
+bd mol wisp gc
+```
+
+Wisps older than 24 hours are flagged as "old" in list output.
 
 ## Wisp Commands
 
 ```bash
-# List wisps
-bd wisp list
-bd wisp list --json
-
-# Show wisp details
-bd wisp show <wisp-id>
-
-# Delete wisp
-bd wisp delete <wisp-id>
-
-# Delete all completed wisps
-bd wisp cleanup
+bd mol wisp <formula>       # Create wisp from formula
+bd mol wisp list             # List all wisps
+bd mol wisp list --json      # List in JSON format
+bd mol wisp gc               # Garbage collect old wisps
+bd mol squash <wisp-id>      # Promote to persistent
+bd mol burn <wisp-id>        # Delete without digest
 ```
 
 ## Wisp vs Molecule
 
-| Aspect | Molecule | Wisp |
-|--------|----------|------|
-| Storage | `.beads/` | `.beads-wisp/` |
-| Git sync | Yes | No |
-| Persistence | Permanent | Ephemeral |
-| Use case | Tracked work | Temporary ops |
+| Aspect | Molecule (pour) | Wisp |
+|--------|-----------------|------|
+| Phase | Liquid | Vapor |
+| Persistence | Permanent, syncs via Dolt | Ephemeral, local-only |
+| Use case | Tracked work, audit trail | Temporary ops, one-time runs |
+| Cleanup | Manual close/archive | Squash, burn, or GC |
 
 ## Phase Control
 
-Use `bd mol bond` to control phase:
+Use `bd mol bond` to control phase when bonding formulas together:
 
 ```bash
 # Force liquid (persistent molecule)
@@ -3659,60 +3922,13 @@ bd mol bond <formula> <target> --pour
 bd mol bond <formula> <target> --wisp
 ```
 
-## Example: Quick Check Workflow
-
-Create a wisp for running checks:
-
-```toml
-# .beads/formulas/quick-check.formula.toml
-formula = "quick-check"
-description = "Quick local checks"
-
-[[steps]]
-id = "lint"
-title = "Run linter"
-
-[[steps]]
-id = "test"
-title = "Run tests"
-needs = ["lint"]
-
-[[steps]]
-id = "build"
-title = "Build project"
-needs = ["test"]
-```
-
-Use as wisp:
-
-```bash
-bd wisp create quick-check
-# Work through steps...
-bd wisp cleanup  # Remove when done
-```
-
-## Auto-Expiration
-
-Wisps can auto-expire:
-
-```toml
-[wisp]
-expires_after = "24h"  # Auto-delete after 24 hours
-```
-
-Or cleanup manually:
-
-```bash
-bd wisp cleanup --all  # Remove all wisps
-bd wisp cleanup --completed  # Remove only completed
-```
-
 ## Best Practices
 
-1. **Use wisps for local-only work** - Don't sync to git
-2. **Clean up regularly** - `bd wisp cleanup`
-3. **Use molecules for tracked work** - Wisps are ephemeral
-4. **Consider CI/CD wisps** - Perfect for pipeline steps
+1. **Default to wisp for operational work** - releases, checks, diagnostics
+2. **Use pour for tracked work** - features, bugs, anything worth preserving
+3. **Squash if work becomes valuable** - promote ephemeral to persistent
+4. **Burn failed experiments** - clean up without cluttering history
+5. **Run GC periodically** - `bd mol wisp gc` keeps the database lean
 
 </document>
 
@@ -4194,7 +4410,7 @@ bd setup claude
 
 This installs:
 - **SessionStart hook** - Runs `bd prime` on session start
-- **PreCompact hook** - Runs `bd dolt push` before context compaction
+- **PreCompact hook** - Runs `bd prime` before context compaction
 
 ### Manual Setup
 
@@ -4204,7 +4420,7 @@ Add to your Claude Code hooks configuration:
 {
   "hooks": {
     "SessionStart": ["bd prime"],
-    "PreCompact": ["bd dolt push"]
+    "PreCompact": ["bd prime"]
   }
 }
 ```
@@ -4314,7 +4530,7 @@ For enhanced UX with slash commands:
 
 ```bash
 # In Claude Code
-/plugin marketplace add steveyegge/beads
+/plugin marketplace add gastownhall/beads
 /plugin install beads
 # Restart Claude Code
 ```
@@ -4503,7 +4719,7 @@ Git hooks are optional. They auto-sync issues but you can skip them during `bd i
 
 - [MCP Server](/integrations/mcp-server) - Detailed MCP configuration
 - [Installation](/getting-started/installation) - Full install guide
-- [Detailed Copilot Guide](https://github.com/steveyegge/beads/blob/main/docs/COPILOT_INTEGRATION.md) - Comprehensive documentation
+- [Detailed Copilot Guide](https://github.com/gastownhall/beads/blob/main/docs/COPILOT_INTEGRATION.md) - Comprehensive documentation
 
 </document>
 
@@ -4952,7 +5168,7 @@ Most issues can be diagnosed with `bd status`. Start there before following spec
 If these runbooks don't resolve your issue:
 
 1. Check the [FAQ](/reference/faq)
-2. Search [existing issues](https://github.com/steveyegge/beads/issues)
+2. Search [existing issues](https://github.com/gastownhall/beads/issues)
 3. Open a new issue with diagnostic output
 
 </document>
@@ -5307,7 +5523,7 @@ storage.UnderlyingDB().Exec(`
 `)
 ```
 
-See [EXTENDING.md](https://github.com/steveyegge/beads/blob/main/docs/EXTENDING.md).
+See [EXTENDING.md](https://github.com/gastownhall/beads/blob/main/docs/EXTENDING.md).
 
 ## Event System
 
@@ -5465,7 +5681,7 @@ bd config set issue_id_mode hash
 | `counter` | `bd-1` | Single-writer, project-management UIs |
 
 Counter IDs are sequential and human-friendly. Hash IDs are collision-free across concurrent
-branches. See [docs/CONFIG.md](/docs/CONFIG.md) for migration guidance and full details.
+branches. See [CONFIG.md](https://github.com/gastownhall/beads/blob/main/docs/CONFIG.md) for migration guidance and full details.
 
 ### Import
 
@@ -5681,7 +5897,7 @@ bd setup aider    # Aider
 
 ### Can beads import from GitHub Issues?
 
-Yes — see the [GitHub integration documentation](https://github.com/steveyegge/beads/blob/main/docs/GITHUB_IMPORT.md) for details.
+Yes — see the [GitHub integration documentation](https://github.com/gastownhall/beads/blob/main/docs/GITHUB_IMPORT.md) for details.
 
 ## Troubleshooting
 
@@ -5711,9 +5927,9 @@ bd hooks status
 
 ### How do I report a bug?
 
-1. Check existing issues: https://github.com/steveyegge/beads/issues
+1. Check existing issues: https://github.com/gastownhall/beads/issues
 2. Include: `bd version`, `bd info --json`, reproduction steps
-3. File at: https://github.com/steveyegge/beads/issues/new
+3. File at: https://github.com/gastownhall/beads/issues/new
 
 </document>
 
@@ -5857,8 +6073,8 @@ go list -f {{.Target}} github.com/steveyegge/beads/cmd/bd
 # Add Go bin to PATH
 export PATH="$PATH:$(go env GOPATH)/bin"
 
-# Or reinstall
-go install github.com/steveyegge/beads/cmd/bd@latest
+# Or reinstall with the recommended installer
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
 ### `zsh: killed bd` on macOS
@@ -5866,7 +6082,7 @@ go install github.com/steveyegge/beads/cmd/bd@latest
 CGO/SQLite compatibility issue:
 
 ```bash
-CGO_ENABLED=1 go install github.com/steveyegge/beads/cmd/bd@latest
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### Permission denied
@@ -6059,7 +6275,7 @@ bd info --json
 uname -a
 ```
 
-Report at: https://github.com/steveyegge/beads/issues
+Report at: https://github.com/gastownhall/beads/issues
 
 </document>
 

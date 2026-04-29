@@ -50,7 +50,7 @@ func buildEmbeddedBD(t *testing.T) string {
 			name = "bd.exe"
 		}
 		embeddedBD = filepath.Join(tmpDir, name)
-		cmd := exec.Command("go", "build", "-o", embeddedBD, ".")
+		cmd := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", embeddedBD, ".")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			embeddedBDErr = fmt.Errorf("go build failed: %v\n%s", err, out)
 		}
@@ -321,6 +321,217 @@ func TestEmbeddedInit(t *testing.T) {
 		}
 	})
 
+	t.Run("plain_git_origin_not_registered_as_dolt_remote", func(t *testing.T) {
+		bareDir := filepath.Join(t.TempDir(), "plain.git")
+		runGitForBootstrapTest(t, "", "init", "--bare", bareDir)
+
+		dir := t.TempDir()
+		initGitRepoAt(t, dir)
+		runGitForBootstrapTest(t, dir, "remote", "add", "origin", bareDir)
+
+		runBDInit(t, bd, dir, "--prefix", "pg", "--skip-hooks", "--skip-agents")
+
+		out := bdDolt(t, bd, dir, "remote", "list")
+		if strings.Contains(out, "origin") {
+			t.Fatalf("plain git origin should not be registered as a Dolt remote; remote list:\n%s", out)
+		}
+
+		configYAML, err := os.ReadFile(filepath.Join(dir, ".beads", "config.yaml"))
+		if err != nil {
+			t.Fatalf("read config.yaml: %v", err)
+		}
+		if strings.Contains(string(configYAML), "sync.remote:") || strings.Contains(string(configYAML), "sync-remote:") {
+			t.Fatalf("plain git origin should not be persisted as sync.remote; config.yaml:\n%s", configYAML)
+		}
+	})
+
+	t.Run("remote_bootstraps_existing_dolt_data", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("uses os.Symlink to mask dolt off PATH; symlink semantics differ on Windows")
+		}
+		remoteDir := filepath.Join(t.TempDir(), "remote")
+		remoteURL := "file://" + remoteDir
+
+		sourceDir, _, _ := bdInit(t, bd, "--prefix", "src", "--skip-hooks", "--skip-agents")
+		sourceCfg, err := configfile.Load(filepath.Join(sourceDir, ".beads"))
+		if err != nil {
+			t.Fatalf("load source metadata.json: %v", err)
+		}
+		if sourceCfg.ProjectID == "" {
+			t.Fatal("source project ID is empty")
+		}
+
+		cmd := exec.Command(bd, "create", "Remote issue", "--type", "task")
+		cmd.Dir = sourceDir
+		cmd.Env = bdEnv(sourceDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("bd create failed: %v\n%s", err, out)
+		}
+		bdDolt(t, bd, sourceDir, "commit")
+		bdDolt(t, bd, sourceDir, "remote", "add", "origin", remoteURL)
+		bdDolt(t, bd, sourceDir, "push", "--force")
+
+		cloneDir := t.TempDir()
+		initGitRepoAt(t, cloneDir)
+		gitBin, err := exec.LookPath("git")
+		if err != nil {
+			t.Fatalf("git not found: %v", err)
+		}
+		pathDir := filepath.Join(t.TempDir(), "path")
+		if err := os.MkdirAll(pathDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(gitBin, filepath.Join(pathDir, "git")); err != nil {
+			t.Fatalf("symlink git into PATH: %v", err)
+		}
+		noDoltEnv := bdEnv(cloneDir)
+		replacedPath := false
+		for i, entry := range noDoltEnv {
+			if strings.HasPrefix(entry, "PATH=") {
+				noDoltEnv[i] = "PATH=" + pathDir
+				replacedPath = true
+				break
+			}
+		}
+		if !replacedPath {
+			noDoltEnv = append(noDoltEnv, "PATH="+pathDir)
+		}
+		cmd = exec.Command(bd, "init", "--quiet", "--prefix", "clone", "--remote", remoteURL, "--skip-hooks", "--skip-agents")
+		cmd.Dir = cloneDir
+		cmd.Env = noDoltEnv
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("bd init --remote without dolt CLI failed: %v\n%s", err, out)
+		}
+
+		cloneCfg, err := configfile.Load(filepath.Join(cloneDir, ".beads"))
+		if err != nil {
+			t.Fatalf("load clone metadata.json: %v", err)
+		}
+		if cloneCfg.ProjectID != sourceCfg.ProjectID {
+			t.Fatalf("clone ProjectID = %q, want source ProjectID %q", cloneCfg.ProjectID, sourceCfg.ProjectID)
+		}
+		if val := readBack(t, filepath.Join(cloneDir, ".beads"), "clone", "_project_id", true); val != sourceCfg.ProjectID {
+			t.Fatalf("clone database _project_id = %q, want source ProjectID %q", val, sourceCfg.ProjectID)
+		}
+
+		cmd = exec.Command(bd, "list")
+		cmd.Dir = cloneDir
+		cmd.Env = bdEnv(cloneDir)
+		listOut, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd list failed: %v\n%s", err, listOut)
+		}
+		if !strings.Contains(string(listOut), "Remote issue") {
+			t.Fatalf("cloned database missing remote issue:\n%s", listOut)
+		}
+
+		cloneBeadsDir := filepath.Join(cloneDir, ".beads")
+		out := bdDolt(t, bd, cloneDir, "remote", "list")
+		if !strings.Contains(out, "origin") || !strings.Contains(out, remoteURL) {
+			t.Fatalf("expected origin remote %q in remote list:\n%s", remoteURL, out)
+		}
+
+		configYAML, err := os.ReadFile(filepath.Join(cloneBeadsDir, "config.yaml"))
+		if err != nil {
+			t.Fatalf("read config.yaml: %v", err)
+		}
+		if !strings.Contains(string(configYAML), remoteURL) {
+			t.Fatalf("config.yaml should persist --remote URL %q:\n%s", remoteURL, configYAML)
+		}
+	})
+
+	t.Run("remote_empty_initializes_fresh_and_wires_origin", func(t *testing.T) {
+		remoteDir := filepath.Join(t.TempDir(), "empty-remote")
+		if err := os.MkdirAll(remoteDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		remoteURL := "file://" + remoteDir
+
+		dir := t.TempDir()
+		initGitRepoAt(t, dir)
+		runBDInit(t, bd, dir, "--prefix", "fresh", "--remote", remoteURL, "--skip-hooks", "--skip-agents")
+
+		beadsDir := filepath.Join(dir, ".beads")
+		if val := readBack(t, beadsDir, "fresh", "issue_prefix", false); val != "fresh" {
+			t.Fatalf("fresh issue_prefix = %q, want %q", val, "fresh")
+		}
+
+		out := bdDolt(t, bd, dir, "remote", "list")
+		if !strings.Contains(out, "origin") || !strings.Contains(out, remoteURL) {
+			t.Fatalf("expected origin remote %q in remote list:\n%s", remoteURL, out)
+		}
+
+		configYAML, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml"))
+		if err != nil {
+			t.Fatalf("read config.yaml: %v", err)
+		}
+		if !strings.Contains(string(configYAML), remoteURL) {
+			t.Fatalf("config.yaml should persist --remote URL %q:\n%s", remoteURL, configYAML)
+		}
+	})
+
+	t.Run("remote_clone_failure_emits_url_and_hint", func(t *testing.T) {
+		// remotesapi:// is rejected by dolt as an unknown scheme almost
+		// instantly, so this exercises the non-empty-remote clone failure
+		// path without depending on TCP timeouts. Verifies (a) init exits
+		// non-zero rather than silently bootstrapping fresh, (b) the wrap
+		// from cmd/bd/init.go echoes the URL the user typed in %q form,
+		// and (c) the Hint: line is present.
+		remoteURL := "remotesapi://127.0.0.1:1/no-such-db"
+		dir := t.TempDir()
+		initGitRepoAt(t, dir)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bd, "init", "--quiet", "--prefix", "fail", "--remote", remoteURL, "--skip-hooks", "--skip-agents")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected bd init --remote with bogus URL to fail; got success:\n%s", out)
+		}
+		wantWrap := fmt.Sprintf("failed to clone remote %q", remoteURL)
+		if !strings.Contains(string(out), wantWrap) {
+			t.Fatalf("expected init.go wrap %q in output; got:\n%s", wantWrap, out)
+		}
+		if !strings.Contains(string(out), "Hint:") {
+			t.Fatalf("expected error output to include a Hint: about reachability/credentials; got:\n%s", out)
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, ".beads", "config.yaml")); statErr == nil {
+			t.Fatalf(".beads/config.yaml should not exist after a failed clone; init must not silently fall through to fresh init")
+		}
+	})
+
+	t.Run("remote_http_url_preserved_verbatim", func(t *testing.T) {
+		// Explicit --remote http:// URL pointed at a refused TCP port:
+		// asserts the URL flows through to the clone call unchanged
+		// (no normalization to git+http://), per GH#3339. The 30s context
+		// caps gRPC dial backoff in case a CI runner ever stalls.
+		remoteURL := "http://127.0.0.1:1/no-such-db"
+		dir := t.TempDir()
+		initGitRepoAt(t, dir)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bd, "init", "--quiet", "--prefix", "fail2", "--remote", remoteURL, "--skip-hooks", "--skip-agents")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected bd init --remote with unreachable http URL to fail; got success:\n%s", out)
+		}
+		// Match the %q-quoted form init.go writes ("http://...") so this
+		// can't accidentally pass against an output that contains the
+		// rewritten "git+http://..." substring.
+		wantWrap := fmt.Sprintf("failed to clone remote %q", remoteURL)
+		if !strings.Contains(string(out), wantWrap) {
+			t.Fatalf("expected init.go wrap %q in output (proves no git+http:// rewrite); got:\n%s", wantWrap, out)
+		}
+		if strings.Contains(string(out), "git+http://127.0.0.1:1") {
+			t.Fatalf("explicit --remote http:// must not be normalized to git+http://; got:\n%s", out)
+		}
+	})
+
 	t.Run("database", func(t *testing.T) {
 		_, beadsDir, _ := bdInit(t, bd, "--database", "custom_db")
 		cfg, err := configfile.Load(beadsDir)
@@ -421,6 +632,36 @@ func TestEmbeddedInit(t *testing.T) {
 		}
 	})
 
+	t.Run("auto_commit_bypasses_hooks", func(t *testing.T) {
+		dir := t.TempDir()
+		initGitRepoAt(t, dir)
+		preCommitPath := filepath.Join(dir, ".git", "hooks", "pre-commit")
+		preCommit := "#!/bin/sh\necho hook-fired >> .hook-ran\nexit 1\n"
+		if err := os.WriteFile(preCommitPath, []byte(preCommit), 0755); err != nil {
+			t.Fatal(err)
+		}
+		unsetHooksPath := exec.Command("git", "config", "--unset", "core.hooksPath")
+		unsetHooksPath.Dir = dir
+		if out, err := unsetHooksPath.CombinedOutput(); err != nil {
+			t.Fatalf("git config --unset core.hooksPath failed: %v\n%s", err, out)
+		}
+
+		runBDInit(t, bd, dir, "--prefix", "hook")
+
+		if _, err := os.Stat(filepath.Join(dir, ".hook-ran")); err == nil {
+			t.Fatal("expected init auto-commit to bypass git hooks")
+		}
+		logCmd := exec.Command("git", "log", "--oneline", "-n", "1")
+		logCmd.Dir = dir
+		logOut, err := logCmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git log failed: %v\n%s", err, logOut)
+		}
+		if !strings.Contains(string(logOut), "bd init: initialize beads issue tracking") {
+			t.Fatalf("expected init commit to succeed, got log: %s", logOut)
+		}
+	})
+
 	t.Run("from_jsonl", func(t *testing.T) {
 		dir := t.TempDir()
 		initGitRepoAt(t, dir)
@@ -440,6 +681,16 @@ func TestEmbeddedInit(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
 			t.Fatal(err)
 		}
+		preCommitPath := filepath.Join(dir, ".git", "hooks", "pre-commit")
+		preCommit := "#!/bin/sh\necho hook-fired >> .hook-ran\nexit 1\n"
+		if err := os.WriteFile(preCommitPath, []byte(preCommit), 0755); err != nil {
+			t.Fatal(err)
+		}
+		unsetHooksPath := exec.Command("git", "config", "--unset", "core.hooksPath")
+		unsetHooksPath.Dir = dir
+		if out, err := unsetHooksPath.CombinedOutput(); err != nil {
+			t.Fatalf("git config --unset core.hooksPath failed: %v\n%s", err, out)
+		}
 
 		cmd := exec.Command(bd, "init", "--prefix", "jl", "--from-jsonl", "--quiet")
 		cmd.Dir = dir
@@ -447,6 +698,18 @@ func TestEmbeddedInit(t *testing.T) {
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("--from-jsonl should succeed now that CreateIssuesWithFullOptions is implemented: %v\n%s", err, out)
+		}
+		if _, err := os.Stat(filepath.Join(dir, ".hook-ran")); err == nil {
+			t.Fatal("expected --from-jsonl auto-commit to bypass git hooks")
+		}
+		logCmd := exec.Command("git", "log", "--oneline", "-n", "1")
+		logCmd.Dir = dir
+		logOut, err := logCmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git log failed: %v\n%s", err, logOut)
+		}
+		if !strings.Contains(string(logOut), "bd init: initialize beads issue tracking") {
+			t.Fatalf("expected init commit to succeed, got log: %s", logOut)
 		}
 	})
 
@@ -491,9 +754,19 @@ func TestEmbeddedInit(t *testing.T) {
 
 	t.Run("metadata_written", func(t *testing.T) {
 		_, beadsDir, _ := bdInit(t, bd, "--prefix", "meta")
-		if val := readBack(t, beadsDir, "meta", "bd_version", true); val == "" {
-			t.Error("bd_version metadata not set")
-		}
+		// bd_version is in local_metadata (dolt-ignored), not metadata
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			store, err := embeddeddolt.New(ctx, beadsDir, "meta", "main")
+			if err != nil {
+				t.Fatalf("failed to open store for bd_version check: %v", err)
+			}
+			defer store.Close()
+			if val, err := store.GetLocalMetadata(ctx, "bd_version"); err != nil || val == "" {
+				t.Error("bd_version local metadata not set")
+			}
+		}()
 		importTime := readBack(t, beadsDir, "meta", "last_import_time", true)
 		if importTime == "" {
 			t.Error("last_import_time metadata not set")
@@ -584,6 +857,42 @@ func TestEmbeddedInit(t *testing.T) {
 		}
 	})
 
+	t.Run("auto_detect_dotted_dirname", func(t *testing.T) {
+		// bd init in a directory named like "MyPkg.jl" (common in Julia repos)
+		// must sanitize the dot when auto-detecting the prefix: metadata.json
+		// DoltDatabase must match the actual Dolt database name so that reopens
+		// succeed and bd list works immediately after init.
+		parent := t.TempDir()
+		dir := filepath.Join(parent, "MyPkg.jl")
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			t.Fatal(err)
+		}
+		initGitRepoAt(t, dir)
+		runBDInit(t, bd, dir)
+
+		beadsDir := filepath.Join(dir, ".beads")
+		cfg, err := configfile.Load(beadsDir)
+		if err != nil {
+			t.Fatalf("failed to load metadata.json: %v", err)
+		}
+		const want = "MyPkg_jl"
+		if cfg.DoltDatabase != want {
+			t.Errorf("DoltDatabase: got %q, want %q (dot must be sanitized)", cfg.DoltDatabase, want)
+		}
+		if val := readBack(t, beadsDir, want, "issue_prefix", false); val != want {
+			t.Errorf("issue_prefix: got %q, want %q", val, want)
+		}
+
+		// Verify bd list succeeds — confirms the database name in metadata.json
+		// matches the actual Dolt database created during init.
+		listCmd := exec.Command(bd, "list", "--json")
+		listCmd.Dir = dir
+		listCmd.Env = bdEnv(dir)
+		if out, err := listCmd.CombinedOutput(); err != nil {
+			t.Fatalf("bd list failed after init in dotted dirname: %v\n%s", err, out)
+		}
+	})
+
 	t.Run("prefix_numeric_sanitized", func(t *testing.T) {
 		parent := t.TempDir()
 		dir := filepath.Join(parent, "001")
@@ -594,6 +903,73 @@ func TestEmbeddedInit(t *testing.T) {
 		runBDInit(t, bd, dir)
 		if val := readBack(t, filepath.Join(dir, ".beads"), "bd_001", "issue_prefix", false); val != "bd_001" {
 			t.Errorf("sanitized issue_prefix: got %q, want %q", val, "bd_001")
+		}
+	})
+
+	t.Run("invalid_dirname_errors_early", func(t *testing.T) {
+		// A directory name like "my project" (space) survives hyphen/dot sanitization
+		// and produces an invalid Dolt database name. The init command should exit
+		// non-zero with a human-readable error rather than a cryptic storage failure.
+		parent := t.TempDir()
+		dir := filepath.Join(parent, "my project")
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			t.Fatal(err)
+		}
+		initGitRepoAt(t, dir)
+		cmd := exec.Command(bd, "init", "--quiet")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatal("bd init should have failed for directory with invalid name")
+		}
+		outStr := string(out)
+		if !strings.Contains(outStr, "invalid database name") && !strings.Contains(outStr, "produces an invalid") {
+			t.Errorf("expected actionable error message, got: %s", outStr)
+		}
+	})
+
+	t.Run("prefix_dot_sanitized", func(t *testing.T) {
+		// A Julia package repo like GPUPolynomials.jl passes --prefix GPUPolynomials.jl.
+		// The dot must be replaced with underscore in both the Dolt database name and
+		// metadata.json DoltDatabase, otherwise reopens fail with a name mismatch.
+		_, beadsDir, _ := bdInit(t, bd, "--prefix", "GPUPolynomials.jl")
+		cfg, err := configfile.Load(beadsDir)
+		if err != nil {
+			t.Fatalf("failed to load metadata.json: %v", err)
+		}
+		const want = "GPUPolynomials_jl"
+		if cfg.DoltDatabase != want {
+			t.Errorf("DoltDatabase: got %q, want %q", cfg.DoltDatabase, want)
+		}
+		if val := readBack(t, beadsDir, want, "issue_prefix", false); val != "GPUPolynomials_jl" {
+			t.Errorf("issue_prefix: got %q, want %q", val, "GPUPolynomials_jl")
+		}
+	})
+
+	t.Run("config_dot_prefix_sanitized", func(t *testing.T) {
+		dir := t.TempDir()
+		initGitRepoAt(t, dir)
+		beadsDir := filepath.Join(dir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("issue-prefix: GPUPolynomials.jl\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		runBDInit(t, bd, dir)
+
+		cfg, err := configfile.Load(beadsDir)
+		if err != nil {
+			t.Fatalf("failed to load metadata.json: %v", err)
+		}
+		const want = "GPUPolynomials_jl"
+		if cfg.DoltDatabase != want {
+			t.Errorf("DoltDatabase: got %q, want %q", cfg.DoltDatabase, want)
+		}
+		if val := readBack(t, beadsDir, want, "issue_prefix", false); val != want {
+			t.Errorf("issue_prefix: got %q, want %q", val, want)
 		}
 	})
 }
@@ -614,9 +990,10 @@ func TestEmbeddedInitConcurrent(t *testing.T) {
 	env := bdEnv(dir)
 
 	type result struct {
-		idx int
-		out string
-		err error
+		idx      int
+		out      string
+		err      error
+		timedOut bool
 	}
 	results := make([]result, N)
 	var wg sync.WaitGroup
@@ -624,17 +1001,24 @@ func TestEmbeddedInitConcurrent(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			cmd := exec.Command(bd, "init", "--prefix", "conc", "--force", "--quiet")
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, bd, "init", "--prefix", "conc", "--force", "--quiet", "--skip-agents")
 			cmd.Dir = dir
 			cmd.Env = env
 			out, err := cmd.CombinedOutput()
-			results[idx] = result{idx: idx, out: string(out), err: err}
+			results[idx] = result{idx: idx, out: string(out), err: err, timedOut: ctx.Err() == context.DeadlineExceeded}
 		}(i)
 	}
 	wg.Wait()
 
 	successes, lockErrors := 0, 0
 	for _, r := range results {
+		if r.timedOut {
+			t.Errorf("process %d timed out after 45s running concurrent bd init: %v\n%s", r.idx, r.err, r.out)
+			continue
+		}
 		if strings.Contains(r.out, "panic") {
 			t.Errorf("process %d panicked:\n%s", r.idx, r.out)
 		}

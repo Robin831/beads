@@ -40,7 +40,7 @@ GitHub Issues + gh CLI can approximate some features, but fundamentally cannot r
 
 **When to use each:** GitHub Issues excels for human teams in web UI with cross-repo dashboards and integrations. bd excels for AI agents needing offline, git-synchronized task memory with graph semantics and deterministic queries.
 
-See [GitHub issue #125](https://github.com/steveyegge/beads/issues/125) for detailed comparison.
+See [GitHub issue #125](https://github.com/gastownhall/beads/issues/125) for detailed comparison.
 
 ### How is this different from Taskwarrior?
 
@@ -194,6 +194,7 @@ bd ready --json  # Start using bd normally
 All writes go directly to the Dolt database and are automatically committed to Dolt history. To sync with Dolt remotes:
 
 ```bash
+bd init --remote http://myserver:7007/mydb  # Configure remote during first init
 bd dolt push    # Push changes to Dolt remote
 bd dolt pull    # Pull changes from Dolt remote
 ```
@@ -489,8 +490,8 @@ bd dolt pull    # Pull from Dolt remote if configured
 - **Documentation**: [README.md](../README.md), [QUICKSTART.md](QUICKSTART.md), [ADVANCED.md](ADVANCED.md)
 - **Troubleshooting**: [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 - **Examples**: [examples/](../examples/)
-- **GitHub Issues**: [Report bugs or request features](https://github.com/steveyegge/beads/issues)
-- **GitHub Discussions**: [Ask questions](https://github.com/steveyegge/beads/discussions)
+- **GitHub Issues**: [Report bugs or request features](https://github.com/gastownhall/beads/issues)
+- **GitHub Discussions**: [Ask questions](https://github.com/gastownhall/beads/discussions)
 
 ### How can I contribute?
 

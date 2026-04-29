@@ -52,6 +52,14 @@ create, update, show, or close operation).`,
 			reason, _ = cmd.Flags().GetString("comment")
 		}
 
+		// --reason-file <path> (with - for stdin) mirrors `bd create --body-file`,
+		// so agents can pass structured close templates without shell-escaping hell (#3512).
+		if fileReason, ok, err := resolveReasonFile(cmd, reason); err != nil {
+			FatalErrorRespectJSON("%v", err)
+		} else if ok {
+			reason = fileReason
+		}
+
 		// Desire-path: "bd done <id> <message>" treats last positional arg as reason
 		// when no reason flag was explicitly provided (hq-pe8ce)
 		if reason == "" && cmd.CalledAs() == "done" && len(args) >= 2 {
@@ -284,6 +292,7 @@ func init() {
 	_ = closeCmd.Flags().MarkHidden("message") // Hidden alias for agent/CLI ergonomics
 	closeCmd.Flags().String("comment", "", "Alias for --reason")
 	_ = closeCmd.Flags().MarkHidden("comment") // Hidden alias for agent/CLI ergonomics
+	closeCmd.Flags().String("reason-file", "", "Read close reason from file (use - for stdin)")
 	closeCmd.Flags().BoolP("force", "f", false, "Force close pinned issues or unsatisfied gates")
 	closeCmd.Flags().Bool("continue", false, "Auto-advance to next step in molecule")
 	closeCmd.Flags().Bool("no-auto", false, "With --continue, show next step but don't claim it")
@@ -327,7 +336,7 @@ func checkGateSatisfaction(issue *types.Issue) error {
 
 	switch {
 	case strings.HasPrefix(issue.AwaitType, "gh:run"):
-		resolved, escalated, reason, err = checkGHRun(issue)
+		resolved, escalated, reason, err = checkGHRun(issue, true)
 	case strings.HasPrefix(issue.AwaitType, "gh:pr"):
 		resolved, escalated, reason, err = checkGHPR(issue)
 	case issue.AwaitType == "timer":
@@ -357,9 +366,10 @@ func checkGateSatisfaction(issue *types.Issue) error {
 	return fmt.Errorf("gate condition not satisfied: %s (use --force to override)", reason)
 }
 
-// autoCloseCompletedMolecule checks if closing a step completed a parent molecule,
-// and if so, auto-closes the molecule root. This prevents stale wisps that are
-// complete but never explicitly closed (e.g., deacon patrol wisps).
+// autoCloseCompletedMolecule checks if closing a step completed an auto-closing
+// parent molecule, and if so, closes the molecule root. Ordinary epics remain
+// open when all children finish so they can become explicitly close-eligible
+// instead of being closed as a side effect of the final child close.
 func autoCloseCompletedMolecule(ctx context.Context, s storage.DoltStorage, closedStepID, actorName, session string) {
 	moleculeID := findParentMolecule(ctx, s, closedStepID)
 	if moleculeID == "" {
@@ -368,7 +378,7 @@ func autoCloseCompletedMolecule(ctx context.Context, s storage.DoltStorage, clos
 
 	// Check if molecule root is already closed
 	root, err := s.GetIssue(ctx, moleculeID)
-	if err != nil || root == nil || root.Status == types.StatusClosed {
+	if err != nil || root == nil || root.Status == types.StatusClosed || !shouldAutoCloseCompletedRoot(root) {
 		return
 	}
 
@@ -391,6 +401,56 @@ func autoCloseCompletedMolecule(ctx context.Context, s storage.DoltStorage, clos
 	if !jsonOutput {
 		fmt.Printf("%s Auto-closed completed molecule %s\n", ui.RenderPass("✓"), formatFeedbackID(moleculeID, root.Title))
 	}
+}
+
+// shouldAutoCloseCompletedRoot returns true for molecule roots that should
+// auto-close when their final step closes. Regular epics stay open and become
+// explicit close-eligible work, while ephemeral wisps, template-driven
+// molecules, and molecule-type coordination roots keep their cleanup behavior.
+func shouldAutoCloseCompletedRoot(root *types.Issue) bool {
+	if root == nil {
+		return false
+	}
+
+	if root.IssueType == types.TypeMolecule || root.Ephemeral {
+		return true
+	}
+
+	if root.IssueType != types.TypeEpic {
+		return false
+	}
+
+	for _, label := range root.Labels {
+		if label == BeadsTemplateLabel {
+			return true
+		}
+	}
+
+	return false
+}
+
+// resolveReasonFile resolves the --reason-file flag for `bd close`.
+// Returns (content, true, nil) when --reason-file was set and read successfully.
+// Returns (_, false, nil) when --reason-file was not set.
+// Returns an error on conflict with an existing reason, file read failure, or empty content.
+// Mirrors the --body-file pattern from `bd create` so agents can pass structured close
+// templates without shell-escaping hell.
+func resolveReasonFile(cmd *cobra.Command, existingReason string) (string, bool, error) {
+	if !cmd.Flags().Changed("reason-file") {
+		return "", false, nil
+	}
+	if existingReason != "" {
+		return "", false, fmt.Errorf("cannot specify both --reason-file and --reason/--resolution/--message/--comment")
+	}
+	path, _ := cmd.Flags().GetString("reason-file")
+	content, err := readBodyFile(path)
+	if err != nil {
+		return "", false, fmt.Errorf("reading reason file %q: %w", path, err)
+	}
+	if strings.TrimSpace(content) == "" {
+		return "", false, fmt.Errorf("--reason-file %q is empty; close reason is required", path)
+	}
+	return content, true, nil
 }
 
 // countEpicOpenChildren returns the number of open (non-closed) children for an epic.

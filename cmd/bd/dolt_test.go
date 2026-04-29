@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +14,89 @@ import (
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/storage"
 )
+
+type fakeRemoteStore struct {
+	remotes []storage.RemoteInfo
+}
+
+func (f fakeRemoteStore) AddRemote(context.Context, string, string) error { return nil }
+func (f fakeRemoteStore) RemoveRemote(context.Context, string) error      { return nil }
+func (f fakeRemoteStore) HasRemote(context.Context, string) (bool, error) { return false, nil }
+func (f fakeRemoteStore) ListRemotes(context.Context) ([]storage.RemoteInfo, error) {
+	return f.remotes, nil
+}
+func (f fakeRemoteStore) Push(context.Context) error                     { return nil }
+func (f fakeRemoteStore) Pull(context.Context) error                     { return nil }
+func (f fakeRemoteStore) ForcePush(context.Context) error                { return nil }
+func (f fakeRemoteStore) PushRemote(context.Context, string, bool) error { return nil }
+func (f fakeRemoteStore) PullRemote(context.Context, string) error       { return nil }
+func (f fakeRemoteStore) Fetch(context.Context, string) error            { return nil }
+func (f fakeRemoteStore) PushTo(context.Context, string) error           { return nil }
+func (f fakeRemoteStore) PullFrom(context.Context, string) ([]storage.Conflict, error) {
+	return nil, nil
+}
+
+func TestListRemoteSurfacesEmbeddedSkipsCLI(t *testing.T) {
+	oldList := listDoltCLIRemotes
+	defer func() { listDoltCLIRemotes = oldList }()
+
+	called := false
+	listDoltCLIRemotes = func(string) ([]storage.RemoteInfo, error) {
+		called = true
+		return []storage.RemoteInfo{{Name: "cli", URL: "file:///cli"}}, nil
+	}
+
+	remote := storage.RemoteInfo{Name: "origin", URL: "file:///origin"}
+	sqlRemotes, sqlErr, cliRemotes, cliErr := listRemoteSurfaces(
+		context.Background(),
+		fakeRemoteStore{remotes: []storage.RemoteInfo{remote}},
+		"/unused",
+		true,
+	)
+	if sqlErr != nil || cliErr != nil {
+		t.Fatalf("unexpected errors: sql=%v cli=%v", sqlErr, cliErr)
+	}
+	if called {
+		t.Fatal("embedded remote surface lookup must not shell out to dolt CLI")
+	}
+	if len(sqlRemotes) != 1 || len(cliRemotes) != 1 || sqlRemotes[0] != remote || cliRemotes[0] != remote {
+		t.Fatalf("embedded surfaces = sql:%v cli:%v, want both %v", sqlRemotes, cliRemotes, remote)
+	}
+}
+
+func TestListRemoteSurfacesServerUsesCLI(t *testing.T) {
+	oldList := listDoltCLIRemotes
+	defer func() { listDoltCLIRemotes = oldList }()
+
+	cliRemote := storage.RemoteInfo{Name: "origin", URL: "file:///cli-origin"}
+	called := false
+	listDoltCLIRemotes = func(dbPath string) ([]storage.RemoteInfo, error) {
+		called = true
+		if dbPath != "/db/path" {
+			t.Fatalf("dbPath = %q, want /db/path", dbPath)
+		}
+		return []storage.RemoteInfo{cliRemote}, nil
+	}
+
+	sqlRemote := storage.RemoteInfo{Name: "origin", URL: "file:///sql-origin"}
+	sqlRemotes, sqlErr, cliRemotes, cliErr := listRemoteSurfaces(
+		context.Background(),
+		fakeRemoteStore{remotes: []storage.RemoteInfo{sqlRemote}},
+		"/db/path",
+		false,
+	)
+	if sqlErr != nil || cliErr != nil {
+		t.Fatalf("unexpected errors: sql=%v cli=%v", sqlErr, cliErr)
+	}
+	if !called {
+		t.Fatal("server-mode remote surface lookup should inspect CLI remotes")
+	}
+	if len(sqlRemotes) != 1 || sqlRemotes[0] != sqlRemote || len(cliRemotes) != 1 || cliRemotes[0] != cliRemote {
+		t.Fatalf("surfaces = sql:%v cli:%v", sqlRemotes, cliRemotes)
+	}
+}
 
 func TestDoltShowConfigNotInRepo(t *testing.T) {
 	// Change to a temp dir without .beads
@@ -79,8 +162,10 @@ func TestDoltShowConfigDefaultMode(t *testing.T) {
 		if !containsAny(output, "testdb", "Database") {
 			t.Errorf("output should show database name: %s", output)
 		}
-		if !containsAny(output, "Host", "Port", "User") {
-			t.Errorf("output should show server connection info: %s", output)
+		// Default mode is embedded; show embedded engine info instead of
+		// server connection details.
+		if !containsAny(output, "embedded", "Data") {
+			t.Errorf("output should show embedded mode info: %s", output)
 		}
 	})
 
@@ -105,6 +190,9 @@ func TestDoltShowConfigDefaultMode(t *testing.T) {
 		}
 		if result["database"] != "testdb" {
 			t.Errorf("expected database 'testdb', got %v", result["database"])
+		}
+		if embedded, ok := result["embedded"].(bool); !ok || !embedded {
+			t.Errorf("expected embedded=true in JSON output, got %v", result["embedded"])
 		}
 		// mode field should no longer be present
 		if _, ok := result["mode"]; ok {
@@ -1038,6 +1126,32 @@ func TestIsRemoteNotFoundErr(t *testing.T) {
 	}
 }
 
+func TestPrintNoRemoteGuidance(t *testing.T) {
+	// Capture stdout output
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	printNoRemoteGuidance()
+
+	w.Close()
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := buf.String()
+
+	if !strings.Contains(output, "No remote is configured") {
+		t.Error("expected guidance to mention 'No remote is configured'")
+	}
+	if !strings.Contains(output, "skipping") {
+		t.Error("expected guidance to indicate the operation was skipped, not failed")
+	}
+	if !strings.Contains(output, "bd dolt remote add") {
+		t.Error("expected guidance to mention how to add a remote")
+	}
+}
+
 func TestPrintDivergedHistoryGuidance(t *testing.T) {
 	// Capture stderr output
 	oldStderr := os.Stderr
@@ -1066,4 +1180,112 @@ func TestPrintDivergedHistoryGuidance(t *testing.T) {
 	if !strings.Contains(output, "rm -rf .beads/dolt") {
 		t.Error("expected guidance to mention manual recovery")
 	}
+}
+
+func TestIsLocalHost(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		want bool
+	}{
+		{"empty defaults to local", "", true},
+		{"localhost literal", "localhost", true},
+		{"uppercase Localhost", "Localhost", true},
+		{"IPv4 loopback", "127.0.0.1", true},
+		{"IPv6 loopback", "::1", true},
+		{"all-zeros bind", "0.0.0.0", true},
+		{"surrounding whitespace", "  127.0.0.1  ", true},
+		{"public IPv4", "20.150.139.92", false},
+		{"named remote", "dolt.example.com", false},
+		{"private LAN IPv4", "192.168.1.10", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isLocalHost(tc.host); got != tc.want {
+				t.Errorf("isLocalHost(%q) = %v, want %v", tc.host, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunExternalDoltStatus_Unreachable exercises the external-server
+// status path (bd-q35w) against an unreachable port. This covers the DSN
+// build, ping failure branch, and both output modes (text + JSON) without
+// needing a running Dolt server.
+func TestRunExternalDoltStatus_Unreachable(t *testing.T) {
+	// Force the resolved port to 1 (guaranteed unreachable on loopback).
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "1")
+
+	beadsDir := t.TempDir()
+	// Use 127.0.0.1 so the OS RSTs the connect() fast (connection refused)
+	// rather than taking the 5s DSN timeout against a routable-but-silent
+	// host. runExternalDoltStatus does not consult isLocalHost itself.
+	cfg := &configfile.Config{
+		DoltMode:       "server",
+		DoltServerHost: "127.0.0.1",
+		DoltServerUser: "root",
+		DoltDatabase:   "beads_ext",
+		DoltServerTLS:  true,
+	}
+
+	t.Run("text output", func(t *testing.T) {
+		orig := jsonOutput
+		defer func() { jsonOutput = orig }()
+		jsonOutput = false
+
+		out := captureStdout(t, func() error { runExternalDoltStatus(beadsDir, cfg); return nil })
+
+		for _, want := range []string{
+			"not reachable (external)",
+			"Host:",
+			"127.0.0.1",
+			"Database:",
+			"beads_ext",
+			"User:",
+			"root",
+			"TLS:",
+			"true",
+			"Error:",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("expected output to contain %q, got:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("json output", func(t *testing.T) {
+		orig := jsonOutput
+		defer func() { jsonOutput = orig }()
+		jsonOutput = true
+
+		out := captureStdout(t, func() error { runExternalDoltStatus(beadsDir, cfg); return nil })
+
+		var result map[string]any
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("expected valid JSON output, got error %v, raw: %s", err, out)
+		}
+
+		if result["mode"] != "external" {
+			t.Errorf("mode = %v, want %q", result["mode"], "external")
+		}
+		if result["running"] != false {
+			t.Errorf("running = %v, want false", result["running"])
+		}
+		if result["host"] != "127.0.0.1" {
+			t.Errorf("host = %v, want %q", result["host"], "127.0.0.1")
+		}
+		if result["database"] != "beads_ext" {
+			t.Errorf("database = %v, want %q", result["database"], "beads_ext")
+		}
+		if result["user"] != "root" {
+			t.Errorf("user = %v, want %q", result["user"], "root")
+		}
+		if result["tls"] != true {
+			t.Errorf("tls = %v, want true", result["tls"])
+		}
+		if _, ok := result["error"]; !ok {
+			t.Error("expected 'error' field in JSON output for unreachable server")
+		}
+	})
 }
