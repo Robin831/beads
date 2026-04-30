@@ -29,6 +29,10 @@ interactions.jsonl
 # Push state (runtime, per-machine)
 push-state.json
 
+# Pull state (runtime, per-machine — parallel to push-state.json,
+# written by the dolt.auto-pull hook)
+pull-state.json
+
 # Lock files (various runtime locks)
 *.lock
 
