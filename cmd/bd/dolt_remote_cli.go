@@ -141,14 +141,21 @@ func tryRemoteCLIPushPull(ctx context.Context, op, remote, branch string) error 
 	if err != nil {
 		// Dolt push/pull sometimes exits non-zero on cosmetic conditions
 		// (spinner cleanup, "nothing to push") even when the operation
-		// succeeded. Check the output for an explicit success marker before
-		// reporting failure.
+		// succeeded. Match only narrow, content-bearing markers — never a
+		// generic "->" ref-update substring, because that fires during the
+		// FETCH phase of a `dolt pull` whose subsequent MERGE failed (e.g.
+		// because bd's parent process is holding the embedded Dolt write
+		// lock). False-positive successes here cause auto-pull/auto-push to
+		// silently skip work for the entire debounce window — see
+		// dolt_autopull.go and dolt_autopush.go.
 		outStr := string(out)
-		successful := strings.Contains(outStr, "[new branch]") ||
-			strings.Contains(outStr, "Everything up-to-date") ||
+		successful := strings.Contains(outStr, "Everything up-to-date") ||
 			strings.Contains(outStr, "Already up to date") ||
-			strings.Contains(outStr, "branch '") && strings.Contains(outStr, "set up to track") ||
-			strings.Contains(outStr, "->") // ref-update line, e.g. "abc..def main -> main"
+			(strings.Contains(outStr, "branch '") && strings.Contains(outStr, "set up to track")) ||
+			(op == "push" && strings.Contains(outStr, "[new branch]")) ||
+			(op == "pull" && (strings.Contains(outStr, "Fast-forward") ||
+				strings.Contains(outStr, "Merge made by") ||
+				strings.Contains(outStr, "Updating ")))
 		if successful {
 			debug.Logf("dolt %s via CLI: dolt exited %v but output indicates success\n", op, err)
 			return nil
