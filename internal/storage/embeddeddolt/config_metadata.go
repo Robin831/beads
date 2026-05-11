@@ -69,6 +69,16 @@ func (s *EmbeddedDoltStore) SetMetadata(ctx context.Context, key, value string) 
 	})
 }
 
+func (s *EmbeddedDoltStore) GetMetadataOnBranch(ctx context.Context, branch, key string) (string, error) {
+	var value string
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		value, err = issueops.GetMetadataAsOfBranchInTx(ctx, tx, branch, key)
+		return err
+	})
+	return value, err
+}
+
 func (s *EmbeddedDoltStore) SetLocalMetadata(ctx context.Context, key, value string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
 		return issueops.SetLocalMetadataInTx(ctx, tx, key, value)

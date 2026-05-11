@@ -879,12 +879,32 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// minting a new one and writing it back would overwrite the
 			// source identity and cause cross-project verification to
 			// fail on subsequent pulls.
+			//
+			// When bootstrapping from a remote, the cloned default branch
+			// (typically main) may not carry _project_id even though a
+			// non-default sync branch (e.g. beads-sync) does — that is
+			// where the team's actual work and identity live. Falling back
+			// to scanning every branch's metadata table keeps metadata.json
+			// in lockstep with whichever branch the caller eventually
+			// checks out post-init.
 			if cfg.ProjectID == "" {
 				if store != nil && (database != "" || bootstrappedFromRemote) {
 					if existingID, err := store.GetMetadata(ctx, "_project_id"); err == nil && existingID != "" {
 						cfg.ProjectID = existingID
 						if !quiet {
 							fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
+						}
+					} else if bootstrappedFromRemote {
+						crossBranchID, crossBranchSource, err := findProjectIDOnAnyBranch(ctx, store)
+						if err != nil {
+							_ = store.Close()
+							FatalError("conflicting _project_id values on different branches of the remote clone (%v); refusing to mint a fresh identity that would mask the corruption — fix the remote before re-running init", err)
+						}
+						if crossBranchID != "" {
+							cfg.ProjectID = crossBranchID
+							if !quiet {
+								fmt.Printf("  %s Adopted project identity from branch %q (default branch had none)\n", ui.RenderPass("✓"), crossBranchSource)
+							}
 						}
 					}
 				}
@@ -1410,6 +1430,67 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			}
 		}
 	},
+}
+
+// branchMetadataReader is the narrow surface findProjectIDOnAnyBranch
+// needs. Defined locally so the function can be unit-tested without
+// constructing a full storage.DoltStorage. Both *embeddeddolt.EmbeddedDoltStore
+// and *dolt.DoltStore satisfy it.
+type branchMetadataReader interface {
+	ListBranches(ctx context.Context) ([]string, error)
+	GetMetadataOnBranch(ctx context.Context, branch, key string) (string, error)
+}
+
+// findProjectIDOnAnyBranch scans every Dolt branch in the just-bootstrapped
+// store for a `_project_id` metadata row. It is the post-clone fallback used
+// when the cloned default branch (typically main) carries no _project_id but
+// a non-default sync branch (e.g. beads-sync) does — that is where teams
+// using the sync-branch workflow actually keep their identity.
+//
+// Returns ("", "", nil) when no branch has the row (caller mints fresh).
+// Returns (id, branch, nil) when exactly one identity is found.
+// Returns ("", "", err) when two or more branches disagree on the value;
+// silently picking one would mask upstream corruption and propagate it to
+// metadata.json.
+func findProjectIDOnAnyBranch(ctx context.Context, store branchMetadataReader) (string, string, error) {
+	branches, err := store.ListBranches(ctx)
+	if err != nil {
+		// Not fatal — caller will fall through to minting a fresh UUID,
+		// which preserves the pre-fix behaviour rather than blocking init
+		// on a transient branch-listing error.
+		return "", "", nil
+	}
+
+	// Record every distinct non-empty value to detect disagreement.
+	seen := map[string]string{} // value -> first branch we saw it on
+	var firstBranch, firstID string
+	for _, branch := range branches {
+		id, err := store.GetMetadataOnBranch(ctx, branch, "_project_id")
+		if err != nil {
+			// A single bad branch (e.g. missing metadata table on an
+			// unrelated branch) shouldn't poison the lookup.
+			continue
+		}
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; !ok {
+			seen[id] = branch
+		}
+		if firstID == "" {
+			firstID = id
+			firstBranch = branch
+		}
+	}
+
+	if len(seen) > 1 {
+		parts := make([]string, 0, len(seen))
+		for id, branch := range seen {
+			parts = append(parts, fmt.Sprintf("%s on %q", id, branch))
+		}
+		return "", "", fmt.Errorf("found %d distinct _project_id values: %s", len(seen), strings.Join(parts, "; "))
+	}
+	return firstID, firstBranch, nil
 }
 
 func init() {

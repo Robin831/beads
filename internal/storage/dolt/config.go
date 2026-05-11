@@ -107,6 +107,19 @@ func (s *DoltStore) GetMetadata(ctx context.Context, key string) (string, error)
 	return value, err
 }
 
+// GetMetadataOnBranch retrieves a metadata value as observed on a specific
+// Dolt branch via AS OF. Returns ("", nil) if the key does not exist on
+// that branch.
+func (s *DoltStore) GetMetadataOnBranch(ctx context.Context, branch, key string) (string, error) {
+	var value string
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		value, err = issueops.GetMetadataAsOfBranchInTx(ctx, tx, branch, key)
+		return err
+	})
+	return value, err
+}
+
 // SetLocalMetadata sets a value in the dolt-ignored local_metadata table.
 // Used for clone-local state that should not generate merge conflicts.
 func (s *DoltStore) SetLocalMetadata(ctx context.Context, key, value string) error {

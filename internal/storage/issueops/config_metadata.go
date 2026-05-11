@@ -76,6 +76,34 @@ func GetMetadataInTx(ctx context.Context, tx *sql.Tx, key string) (string, error
 	return value, nil
 }
 
+// GetMetadataAsOfBranchInTx retrieves a metadata value as observed on a
+// specific Dolt branch, using `AS OF '<branch>'`. Returns ("", nil) if the
+// key does not exist on that branch.
+//
+// Dolt's SQL parser does not allow parameterizing the AS OF target, so the
+// branch name is interpolated. Callers must pass a branch name sourced from
+// `dolt_branches.name` (or another trusted source) — never user-supplied
+// input. As belt-and-suspenders this rejects names containing quote / escape
+// characters that could close out of the literal.
+func GetMetadataAsOfBranchInTx(ctx context.Context, tx *sql.Tx, branch, key string) (string, error) {
+	if branch == "" {
+		return "", fmt.Errorf("get metadata %s as of branch: empty branch name", key)
+	}
+	if strings.ContainsAny(branch, "'\"`;\\") {
+		return "", fmt.Errorf("get metadata %s as of branch %q: branch name contains disallowed characters", key, branch)
+	}
+	query := fmt.Sprintf("SELECT value FROM metadata AS OF '%s' WHERE `key` = ?", branch)
+	var value string
+	err := tx.QueryRowContext(ctx, query, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get metadata %s as of branch %q: %w", key, branch, err)
+	}
+	return value, nil
+}
+
 // SetLocalMetadataInTx sets a value in the dolt-ignored local_metadata table
 // within an existing transaction. Used for clone-local state that should not
 // generate merge conflicts (tip timestamps, version stamps, sync cursors).
