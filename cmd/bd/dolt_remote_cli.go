@@ -136,6 +136,12 @@ func tryRemoteCLIPushPull(ctx context.Context, op, remote, branch string) error 
 	debug.Logf("dolt %s via CLI: cwd=%s args=%v\n", op, dir, args)
 	cmd := exec.CommandContext(ctx, "dolt", args...)
 	cmd.Dir = dir
+	// Suppress the brief console-window flash on Windows. The dolt CLI is
+	// a console binary; without CREATE_NO_WINDOW, every push/pull (which
+	// run via the dolt-sync scheduled task every minute, plus every
+	// auto-pull/auto-push hook on bd commands) momentarily attaches a
+	// console and pops a terminal frame. No-op on non-Windows.
+	hideWindow(cmd)
 	// Inherit env so DOLT_REMOTE_PASSWORD propagates.
 	out, err := cmd.CombinedOutput()
 	if err != nil {
