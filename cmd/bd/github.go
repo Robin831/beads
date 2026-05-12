@@ -232,6 +232,19 @@ func getGitHubConfigValue(ctx context.Context, key string) string {
 		}
 	}
 
+	// Secondary fallback for github.token only: accept GH_TOKEN, the
+	// canonical env var the gh CLI sets via `gh auth login` and the one
+	// most modern dev workflows export. The primary GITHUB_TOKEN lookup
+	// above is preserved, so anyone who already has GITHUB_TOKEN set
+	// keeps the same behaviour. Scoped narrowly to github.token — the
+	// gh CLI doesn't set GH_OWNER / GH_REPO, so the other config keys
+	// gain nothing from a similar fallback and could mislead.
+	if key == "github.token" {
+		if value := os.Getenv("GH_TOKEN"); value != "" {
+			return value
+		}
+	}
+
 	return ""
 }
 
@@ -256,7 +269,7 @@ func githubConfigToEnvVar(key string) string {
 // validateGitHubConfig checks that required configuration is present.
 func validateGitHubConfig(config GitHubConfig) error {
 	if config.Token == "" {
-		return fmt.Errorf("github.token is not configured. Set via 'bd config set github.token <token>' or GITHUB_TOKEN environment variable")
+		return fmt.Errorf("github.token is not configured. Set via 'bd config set github.token <token>', or the GITHUB_TOKEN or GH_TOKEN environment variable")
 	}
 	if config.Owner == "" {
 		return fmt.Errorf("github.owner is not configured. Set via 'bd config set github.owner <owner>' or GITHUB_OWNER environment variable")
@@ -318,7 +331,7 @@ func runGitHubStatus(cmd *cobra.Command, args []string) error {
 func runGitHubRepos(cmd *cobra.Command, args []string) error {
 	config := getGitHubConfig()
 	if config.Token == "" {
-		return fmt.Errorf("github.token is not configured. Set via 'bd config set github.token <token>' or GITHUB_TOKEN environment variable")
+		return fmt.Errorf("github.token is not configured. Set via 'bd config set github.token <token>', or the GITHUB_TOKEN or GH_TOKEN environment variable")
 	}
 
 	out := cmd.OutOrStdout()
