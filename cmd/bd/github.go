@@ -204,6 +204,17 @@ func getGitHubConfigValue(ctx context.Context, key string) string {
 				return value
 			}
 		}
+		// Same GH_TOKEN secondary fallback as the post-store branch below.
+		// github.token is a yaml-only key, so it reaches THIS branch and
+		// never the post-store fallback below — without this duplicate,
+		// autosync silently no-ops on any deployment whose process env
+		// only has GH_TOKEN (gh CLI, GitHub Actions, kubernetes pods that
+		// wire only GH_TOKEN from a secret).
+		if key == "github.token" {
+			if value := os.Getenv("GH_TOKEN"); value != "" {
+				return value
+			}
+		}
 		return ""
 	}
 
