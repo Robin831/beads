@@ -1267,8 +1267,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			}
 		}
 
-		// Auto-setup Claude hooks for project (writes to .claude/settings.json)
-		// so bd prime runs automatically. Skip in stealth mode or when agents are skipped.
+		// Auto-setup Claude hooks for project (writes to .claude/settings.local.json
+		// — Claude Code's canonical machine-local override path, gitignored by
+		// convention) so bd prime runs automatically. Skip in stealth mode or when
+		// agents are skipped.
 		if !stealth && !skipAgents && !isBareGitRepo() {
 			if err := setup.InstallClaudeProject(stealth); err != nil {
 				if !quiet {
@@ -1290,12 +1292,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					agentsCmd := exec.Command("git", "add", agentsFileToStage)
 					_ = agentsCmd.Run()
 				}
-				// Also stage Claude settings if created by init
-				claudeSettingsPath := filepath.Join(".claude", "settings.json")
-				if _, statErr := os.Stat(claudeSettingsPath); statErr == nil {
-					claudeCmd := exec.Command("git", "add", claudeSettingsPath)
-					_ = claudeCmd.Run()
-				}
+				// Claude settings now go to .claude/settings.local.json which is
+				// gitignored (machine-local override). Do NOT stage it — bd's hooks
+				// are per-machine and should not be committed alongside project work.
 				// Also stage CLAUDE.md if created by setup
 				if _, statErr := os.Stat("CLAUDE.md"); statErr == nil {
 					claudeMdCmd := exec.Command("git", "add", "CLAUDE.md")

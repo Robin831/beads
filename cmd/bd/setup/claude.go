@@ -57,12 +57,24 @@ func defaultClaudeEnv() (claudeEnv, error) {
 	}, nil
 }
 
+// projectSettingsPath is where bd writes its Claude Code hooks for a project.
+// Uses .claude/settings.local.json (Claude Code's canonical machine-local
+// override path) rather than .claude/settings.json (the project-tracked
+// path). bd's hooks are inherently machine-local — they require the bd
+// binary to be installed on the host — so they don't belong in a tracked
+// file that gets shared with teammates. Writing to .local also avoids the
+// untracked-vs-tracked git collision that broke `git pull` on anvil
+// checkouts when a project committed its own .claude/settings.json.
 func projectSettingsPath(base string) string {
-	return filepath.Join(base, ".claude", "settings.json")
+	return filepath.Join(base, ".claude", "settings.local.json")
 }
 
+// legacyProjectSettingsPath is the pre-FHI-fork location where bd used to
+// write project-level hooks. checkClaude still detects hooks here so users
+// who upgraded from the upstream behaviour see a migration prompt rather
+// than a silent "hooks missing" state.
 func legacyProjectSettingsPath(base string) string {
-	return filepath.Join(base, ".claude", "settings.local.json")
+	return filepath.Join(base, ".claude", "settings.json")
 }
 
 func globalSettingsPath(home string) string {
@@ -228,8 +240,8 @@ func checkClaude(env claudeEnv) error {
 	case hasBeadsHooks(globalSettings):
 		_, _ = fmt.Fprintf(env.stdout, "✓ Global hooks installed: %s\n", globalSettings)
 	case hasBeadsHooks(legacySettings):
-		_, _ = fmt.Fprintf(env.stdout, "✓ Project hooks installed (legacy): %s\n", legacySettings)
-		_, _ = fmt.Fprintf(env.stdout, "  Consider running 'bd setup claude' to migrate to .claude/settings.json\n")
+		_, _ = fmt.Fprintf(env.stdout, "✓ Project hooks installed (legacy tracked path): %s\n", legacySettings)
+		_, _ = fmt.Fprintf(env.stdout, "  Consider running 'bd setup claude' to migrate to .claude/settings.local.json (the machine-local path that won't collide with project-tracked settings).\n")
 	case hasBeadsPlugin(env):
 		// GH#3192: Plugin provides hooks via plugin.json — no project-level hooks needed
 		_, _ = fmt.Fprintln(env.stdout, "✓ Hooks provided by beads plugin (plugin-managed)")

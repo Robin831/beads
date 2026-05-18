@@ -89,11 +89,13 @@ bd.db
 `
 
 // ProjectGitignorePatterns are patterns that should be in the project-root .gitignore
-// to prevent accidentally committing Dolt database files and credential keys.
+// to prevent accidentally committing Dolt database files, credential keys, and
+// Claude Code's machine-local settings override (which bd writes its hooks to).
 var ProjectGitignorePatterns = []string{
 	".dolt/",
 	"*.db",
 	".beads-credential-key",
+	".claude/settings.local.json",
 }
 
 // projectGitignoreComment is the section header added to the project .gitignore
