@@ -226,13 +226,28 @@ The remote must already exist (see 'bd dolt remote add').`,
 		remote, _ := cmd.Flags().GetString("remote")
 		if remote != "" {
 			fmt.Printf("Pushing to Dolt remote %q...\n", remote)
-			if err := st.PushRemote(ctx, remote, force); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				if isRemoteNotFoundErr(err) {
+			// Same CLI fallback as the default-remote branch below: when
+			// DOLT_REMOTE_USER is set, the embedded engine's CALL DOLT_PUSH
+			// ignores it and remotesapi auth fails. The CLI subprocess does
+			// honour --user, so try that first. --force isn't supported by
+			// the fallback, so force-push still goes through the embedded
+			// engine.
+			var pushErr error
+			if force {
+				pushErr = st.PushRemote(ctx, remote, force)
+			} else {
+				pushErr = tryRemoteCLIPushPull(ctx, "push", remote, "")
+				if errors.Is(pushErr, errRemoteCLINotApplicable) {
+					pushErr = st.PushRemote(ctx, remote, force)
+				}
+			}
+			if pushErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", pushErr)
+				if isRemoteNotFoundErr(pushErr) {
 					fmt.Fprintf(os.Stderr, "\nRemote %q is not configured.\n", remote)
 					fmt.Fprintln(os.Stderr, "Use 'bd dolt remote add <name> <url>' to add it.")
 					fmt.Fprintln(os.Stderr, "Use 'bd dolt remote list' to see configured remotes.")
-				} else if isDivergedHistoryErr(err) {
+				} else if isDivergedHistoryErr(pushErr) {
 					printDivergedHistoryGuidance("push --force")
 				}
 				os.Exit(1)
@@ -294,13 +309,23 @@ The remote must already exist (see 'bd dolt remote add').`,
 		remote, _ := cmd.Flags().GetString("remote")
 		if remote != "" {
 			fmt.Printf("Pulling from Dolt remote %q...\n", remote)
-			if err := st.PullRemote(ctx, remote); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				if isRemoteNotFoundErr(err) {
+			// Same CLI fallback as the default-remote branch below: when
+			// DOLT_REMOTE_USER is set, the embedded engine's CALL DOLT_PULL
+			// ignores it and remotesapi auth fails. The CLI subprocess
+			// does honour --user, so try that first and fall through to
+			// PullRemote only when the CLI path is not applicable (e.g.
+			// DOLT_REMOTE_USER unset or embedded layout not resolvable).
+			pullErr := tryRemoteCLIPushPull(ctx, "pull", remote, "")
+			if errors.Is(pullErr, errRemoteCLINotApplicable) {
+				pullErr = st.PullRemote(ctx, remote)
+			}
+			if pullErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", pullErr)
+				if isRemoteNotFoundErr(pullErr) {
 					fmt.Fprintf(os.Stderr, "\nRemote %q is not configured.\n", remote)
 					fmt.Fprintln(os.Stderr, "Use 'bd dolt remote add <name> <url>' to add it.")
 					fmt.Fprintln(os.Stderr, "Use 'bd dolt remote list' to see configured remotes.")
-				} else if isDivergedHistoryErr(err) {
+				} else if isDivergedHistoryErr(pullErr) {
 					printDivergedHistoryGuidance("pull")
 				}
 				os.Exit(1)
