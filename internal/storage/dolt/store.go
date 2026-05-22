@@ -2295,7 +2295,7 @@ func (s *DoltStore) pullWithAutoResolve(ctx context.Context, query string, args 
 
 	// Check for merge conflicts regardless of whether DOLT_PULL errored.
 	// Some Dolt versions error on conflicts, others leave them in the working set.
-	resolved, resolveErr := s.tryAutoResolveMetadataConflicts(ctx, tx)
+	resolved, resolveErr := s.tryAutoResolveConflicts(ctx, tx)
 	if resolveErr != nil {
 		_ = tx.Rollback()
 		if pullErr != nil {
@@ -2313,10 +2313,21 @@ func (s *DoltStore) pullWithAutoResolve(ctx context.Context, query string, args 
 	return tx.Commit()
 }
 
-// tryAutoResolveMetadataConflicts checks if all merge conflicts are on the metadata
-// table and resolves them with "theirs" strategy. Returns (true, nil) if all conflicts
-// were resolved, (false, nil) if non-metadata conflicts exist, or (false, err) on error.
-func (s *DoltStore) tryAutoResolveMetadataConflicts(ctx context.Context, tx *sql.Tx) (bool, error) {
+// tryAutoResolveConflicts inspects dolt_conflicts and resolves the table-specific
+// conflicts that have a safe deterministic strategy:
+//   - metadata: "theirs" wins (GH#2466 — auto_push rows differ per machine)
+//   - issues:   per-row, the side with the later updated_at wins
+//
+// Returns (true, nil) when every conflicting table is one we know how to resolve
+// AND we successfully resolved+committed; (false, nil) when there are unresolved
+// conflicts on other tables (caller should treat that as an unresolvable pull and
+// roll back); (false, err) on a hard error.
+//
+// This guards against the "wedged working tree" failure mode where a divergent
+// auto-pull leaves the issues table in conflict state, blocking every subsequent
+// bd write at the compat-migration commit step (error: the table(s) issues are
+// in conflict / Merge conflict detected, @autocommit transaction rolled back).
+func (s *DoltStore) tryAutoResolveConflicts(ctx context.Context, tx *sql.Tx) (bool, error) {
 	rows, err := tx.QueryContext(ctx, "SELECT `table`, num_conflicts FROM dolt_conflicts")
 	if err != nil {
 		return false, fmt.Errorf("failed to query conflicts: %w", err)
@@ -2344,27 +2355,175 @@ func (s *DoltStore) tryAutoResolveMetadataConflicts(ctx context.Context, tx *sql
 		return false, nil // No conflicts to resolve — error was something else
 	}
 
-	// Only auto-resolve if ALL conflicts are on the metadata table.
+	// Every conflicting table must be one we know how to auto-resolve. If any
+	// other table is in conflict, bail and let the caller surface the error.
 	for _, c := range conflicts {
-		if c.table != "metadata" {
+		if c.table != "metadata" && c.table != "issues" {
 			return false, nil
 		}
 	}
 
-	// Resolve metadata conflicts with "theirs" — remote values win.
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_CONFLICTS_RESOLVE('--theirs', 'metadata')"); err != nil {
-		return false, fmt.Errorf("failed to resolve metadata conflicts: %w", err)
+	var resolvedTables []string
+	for _, c := range conflicts {
+		switch c.table {
+		case "metadata":
+			// Remote wins — metadata rows like dolt_auto_push_* are machine-local.
+			if _, err := tx.ExecContext(ctx, "CALL DOLT_CONFLICTS_RESOLVE('--theirs', 'metadata')"); err != nil {
+				return false, fmt.Errorf("failed to resolve metadata conflicts: %w", err)
+			}
+			resolvedTables = append(resolvedTables, "metadata")
+		case "issues":
+			ok, err := s.resolveIssuesConflictsByUpdatedAt(ctx, tx)
+			if err != nil {
+				return false, fmt.Errorf("failed to resolve issues conflicts: %w", err)
+			}
+			if !ok {
+				// At least one row could not be safely resolved (e.g. delete/modify
+				// or missing timestamp). Don't partial-commit; let the caller error.
+				return false, nil
+			}
+			resolvedTables = append(resolvedTables, "issues")
+		}
 	}
 
-	// GH#2455: Stage only metadata (the table we resolved), not all dirty tables.
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD('metadata')"); err != nil {
-		return false, fmt.Errorf("failed to stage metadata: %w", err)
+	// GH#2455: Stage only the tables we resolved, not all dirty tables — avoids
+	// sweeping up stale rows from concurrent operations.
+	for _, table := range resolvedTables {
+		if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table); err != nil {
+			return false, fmt.Errorf("failed to stage %s: %w", table, err)
+		}
 	}
-	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', 'auto-resolve metadata merge conflicts (GH#2466)')"); err != nil {
+	msg := fmt.Sprintf("auto-resolve merge conflicts on %s", strings.Join(resolvedTables, ", "))
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?)", msg); err != nil {
 		return false, fmt.Errorf("failed to commit resolved conflicts: %w", err)
 	}
 
 	return true, nil
+}
+
+// resolveIssuesConflictsByUpdatedAt resolves every conflicting row in the
+// issues table by keeping the side whose updated_at is later. Returns
+// (true, nil) when every row was resolved, (false, nil) when at least one
+// row needs human review (delete-vs-modify, NULL updated_at, or equal
+// timestamps on differing rows), or (false, err) on a hard error.
+//
+// Mechanism: for rows where theirs is newer, copy theirs's columns into our
+// working tree via UPDATE, then accept all remaining conflict markers with
+// DOLT_CONFLICTS_RESOLVE('--ours'). The set of columns to copy is discovered
+// from INFORMATION_SCHEMA so the resolver tracks future schema additions.
+func (s *DoltStore) resolveIssuesConflictsByUpdatedAt(ctx context.Context, tx *sql.Tx) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT
+			COALESCE(our_id, their_id, base_id) AS row_id,
+			our_updated_at,
+			their_updated_at,
+			our_diff_type,
+			their_diff_type
+		FROM dolt_conflicts_issues
+	`)
+	if err != nil {
+		return false, fmt.Errorf("query issues conflicts: %w", err)
+	}
+	defer rows.Close()
+
+	var (
+		theirsWinnerCount int
+		anyConflict       bool
+	)
+	for rows.Next() {
+		anyConflict = true
+		var (
+			id                       sql.NullString
+			ourDiff, theirDiff       sql.NullString
+			ourUpdated, theirUpdated sql.NullTime
+		)
+		if err := rows.Scan(&id, &ourUpdated, &theirUpdated, &ourDiff, &theirDiff); err != nil {
+			return false, fmt.Errorf("scan issues conflict: %w", err)
+		}
+		// Delete-vs-modify needs human judgement.
+		if (ourDiff.Valid && ourDiff.String == "removed") || (theirDiff.Valid && theirDiff.String == "removed") {
+			return false, nil
+		}
+		// Need a timestamp on both sides to decide.
+		if !ourUpdated.Valid || !theirUpdated.Valid {
+			return false, nil
+		}
+		if theirUpdated.Time.After(ourUpdated.Time) {
+			theirsWinnerCount++
+		} else if theirUpdated.Time.Equal(ourUpdated.Time) {
+			// Identical timestamps but a conflict exists — the rows differ.
+			// Tie-breaking by clock would be arbitrary; let a human look.
+			return false, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if err := rows.Close(); err != nil {
+		return false, err
+	}
+	if !anyConflict {
+		return false, nil
+	}
+
+	// If theirs wins on at least one row, overwrite our working tree for those
+	// rows so the subsequent --ours resolve produces the merged-by-timestamp result.
+	if theirsWinnerCount > 0 {
+		cols, err := nonPKColumns(ctx, tx, "issues", "id")
+		if err != nil {
+			return false, fmt.Errorf("look up issues columns: %w", err)
+		}
+		if len(cols) == 0 {
+			return false, fmt.Errorf("no non-PK columns found for issues — schema lookup empty")
+		}
+		setClauses := make([]string, 0, len(cols))
+		for _, col := range cols {
+			setClauses = append(setClauses, fmt.Sprintf("i.`%s` = c.`their_%s`", col, col))
+		}
+		// Only update rows where theirs is strictly newer. Modify-vs-add (no base)
+		// is fine — our_id will match by PK regardless of base presence.
+		upd := fmt.Sprintf(`
+			UPDATE issues i
+			JOIN dolt_conflicts_issues c ON i.id = COALESCE(c.our_id, c.their_id)
+			SET %s
+			WHERE c.their_updated_at > c.our_updated_at
+		`, strings.Join(setClauses, ", "))
+		if _, err := tx.ExecContext(ctx, upd); err != nil {
+			return false, fmt.Errorf("apply theirs to issues working tree: %w", err)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_CONFLICTS_RESOLVE('--ours', 'issues')"); err != nil {
+		return false, fmt.Errorf("dolt_conflicts_resolve --ours issues: %w", err)
+	}
+	return true, nil
+}
+
+// nonPKColumns returns the non-primary-key column names for a table in the
+// current database, in ordinal order. Used to build dynamic UPDATE statements
+// against dolt_conflicts_<table>.
+func nonPKColumns(ctx context.Context, tx *sql.Tx, table, pkColumn string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT COLUMN_NAME
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND COLUMN_NAME != ?
+		ORDER BY ORDINAL_POSITION
+	`, table, pkColumn)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		cols = append(cols, c)
+	}
+	return cols, rows.Err()
 }
 
 // Branch creates a new branch

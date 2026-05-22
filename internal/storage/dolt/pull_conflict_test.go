@@ -74,10 +74,10 @@ func TestPullAutoResolveMetadataConflicts(t *testing.T) {
 	// mergeErr may or may not be nil depending on Dolt version.
 
 	// Try auto-resolve.
-	resolved, resolveErr := store.tryAutoResolveMetadataConflicts(ctx, tx)
+	resolved, resolveErr := store.tryAutoResolveConflicts(ctx, tx)
 	if resolveErr != nil {
 		_ = tx.Rollback()
-		t.Fatalf("tryAutoResolveMetadataConflicts error: %v (mergeErr: %v)", resolveErr, mergeErr)
+		t.Fatalf("tryAutoResolveConflicts error: %v (mergeErr: %v)", resolveErr, mergeErr)
 	}
 	if !resolved {
 		_ = tx.Rollback()
@@ -103,9 +103,10 @@ func TestPullAutoResolveMetadataConflicts(t *testing.T) {
 	}
 }
 
-// TestPullAutoResolveSkipsNonMetadataConflicts verifies that conflicts on
-// tables other than metadata are NOT auto-resolved.
-func TestPullAutoResolveSkipsNonMetadataConflicts(t *testing.T) {
+// TestPullAutoResolveSkipsUnknownTableConflicts verifies that conflicts on
+// tables outside the auto-resolvable set (metadata, issues) are NOT
+// auto-resolved.
+func TestPullAutoResolveSkipsUnknownTableConflicts(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 
@@ -119,12 +120,13 @@ func TestPullAutoResolveSkipsNonMetadataConflicts(t *testing.T) {
 		t.Fatalf("failed to get current branch: %v", err)
 	}
 
-	// Create an issue on the current branch.
+	// Seed a config row on the current branch so the divergent branch can fork from a
+	// shared base where the key exists.
 	if _, err := db.ExecContext(ctx,
-		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('conflict-test', 'Local Title', '', '', '', '', 'open', 2, 'task')"); err != nil {
-		t.Fatalf("failed to insert issue on current branch: %v", err)
+		"INSERT INTO config (`key`, value) VALUES ('conflict-test', 'local')"); err != nil {
+		t.Fatalf("failed to insert config on current branch: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'local issue')"); err != nil {
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'local config')"); err != nil {
 		t.Fatalf("failed to commit on current branch: %v", err)
 	}
 
@@ -138,15 +140,15 @@ func TestPullAutoResolveSkipsNonMetadataConflicts(t *testing.T) {
 		db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", remoteBranch)
 	}()
 
-	// Insert conflicting issue on remote branch (same PK, different title).
+	// Insert conflicting config on remote branch (same PK, different value).
 	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", remoteBranch); err != nil {
 		t.Fatalf("failed to checkout remote branch: %v", err)
 	}
 	if _, err := db.ExecContext(ctx,
-		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('conflict-test', 'Remote Title', '', '', '', '', 'open', 2, 'task')"); err != nil {
-		t.Fatalf("failed to insert issue on remote branch: %v", err)
+		"INSERT INTO config (`key`, value) VALUES ('conflict-test', 'remote')"); err != nil {
+		t.Fatalf("failed to insert config on remote branch: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'remote issue')"); err != nil {
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'remote config')"); err != nil {
 		t.Fatalf("failed to commit on remote branch: %v", err)
 	}
 
@@ -167,23 +169,131 @@ func TestPullAutoResolveSkipsNonMetadataConflicts(t *testing.T) {
 
 	_, mergeErr := tx.ExecContext(ctx, "CALL DOLT_MERGE(?)", remoteBranch)
 
-	// Issues table conflict should NOT be auto-resolved.
-	resolved, resolveErr := store.tryAutoResolveMetadataConflicts(ctx, tx)
+	// config table conflict should NOT be auto-resolved.
+	resolved, resolveErr := store.tryAutoResolveConflicts(ctx, tx)
 	_ = tx.Rollback()
 
 	if mergeErr == nil && resolveErr == nil && !resolved {
-		// Clean merge — Dolt auto-merged the issue changes.
-		t.Skip("merge succeeded without conflicts — cannot test non-metadata conflict path")
+		// Clean merge — Dolt auto-merged the config changes.
+		t.Skip("merge succeeded without conflicts — cannot test unknown-table conflict path")
 		return
 	}
 
 	if resolveErr != nil {
 		// Error checking conflicts is acceptable for some Dolt versions.
-		t.Logf("tryAutoResolveMetadataConflicts returned error: %v", resolveErr)
+		t.Logf("tryAutoResolveConflicts returned error: %v", resolveErr)
 		return
 	}
 
 	if resolved {
-		t.Error("expected non-metadata conflicts NOT to be auto-resolved")
+		t.Error("expected conflicts on unknown table (config) NOT to be auto-resolved")
+	}
+}
+
+// TestPullAutoResolveIssuesByUpdatedAt verifies that a modify/modify conflict
+// on the issues table is auto-resolved by keeping the row with the later
+// updated_at. Reproduces the forge-pod wedge where divergent in_progress/open
+// updates on the same bead would otherwise block every subsequent bd write.
+func TestPullAutoResolveIssuesByUpdatedAt(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	db := store.db
+
+	var currentBranch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
+		t.Fatalf("failed to get current branch: %v", err)
+	}
+
+	// Seed a shared issue on the current branch.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, updated_at)
+		VALUES ('issue-conflict-test', 'Shared', '', '', '', '', 'open', 2, 'task', '2026-01-01 00:00:00')
+	`); err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'seed issue')"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	// "Ours" — bump status, older updated_at.
+	if _, err := db.ExecContext(ctx, `
+		UPDATE issues SET status = 'in_progress', updated_at = '2026-05-22 03:00:00'
+		WHERE id = 'issue-conflict-test'
+	`); err != nil {
+		t.Fatalf("update ours: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'ours: in_progress (older)')"); err != nil {
+		t.Fatalf("commit ours: %v", err)
+	}
+
+	// Fork a "remote" branch from the seed and apply a different update with a NEWER timestamp.
+	remoteBranch := currentBranch + "_remote_issues"
+	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH(?, 'HEAD~1')", remoteBranch); err != nil {
+		t.Fatalf("create remote branch: %v", err)
+	}
+	defer func() {
+		db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch)
+		db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", remoteBranch)
+	}()
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", remoteBranch); err != nil {
+		t.Fatalf("checkout remote: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		UPDATE issues SET status = 'closed', updated_at = '2026-05-22 03:05:00'
+		WHERE id = 'issue-conflict-test'
+	`); err != nil {
+		t.Fatalf("update theirs: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'theirs: closed (newer)')"); err != nil {
+		t.Fatalf("commit theirs: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch); err != nil {
+		t.Fatalf("checkout current: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("allow commit conflicts: %v", err)
+	}
+
+	_, mergeErr := tx.ExecContext(ctx, "CALL DOLT_MERGE(?)", remoteBranch)
+	// mergeErr may or may not be nil depending on Dolt version — the conflict
+	// surfaces in dolt_conflicts either way.
+
+	resolved, resolveErr := store.tryAutoResolveConflicts(ctx, tx)
+	if resolveErr != nil {
+		_ = tx.Rollback()
+		t.Fatalf("tryAutoResolveConflicts: %v (mergeErr: %v)", resolveErr, mergeErr)
+	}
+	if !resolved {
+		_ = tx.Rollback()
+		if mergeErr != nil {
+			t.Fatalf("merge failed and issues conflict was not auto-resolved: %v", mergeErr)
+		}
+		t.Skip("merge succeeded without conflicts — cannot test issues conflict path")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+
+	// Theirs had the newer updated_at, so the resolved status should be 'closed'.
+	var status string
+	if err := db.QueryRowContext(ctx,
+		"SELECT status FROM issues WHERE id = 'issue-conflict-test'").Scan(&status); err != nil {
+		t.Fatalf("read resolved row: %v", err)
+	}
+	if status != "closed" {
+		t.Errorf("expected resolved status 'closed' (theirs, newer updated_at), got %q", status)
 	}
 }
