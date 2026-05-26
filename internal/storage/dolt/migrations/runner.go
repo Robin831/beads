@@ -93,6 +93,13 @@ func RunCompatMigrations(db *sql.DB) error {
 		dirtyCount = 1
 	}
 	if dirtyCount == 0 {
+		// All migrations were no-ops on this database. Stamp the version
+		// anyway so the next invocation can short-circuit the whole loop
+		// — without this, `alreadyMigratedThisVersion` keeps returning
+		// false on every command and the perf win (the entire point of
+		// CompatMigrationVersion) never kicks in for an already-current
+		// database (which is the common case in production).
+		stampCompatMigrationVersion(db)
 		return nil
 	}
 

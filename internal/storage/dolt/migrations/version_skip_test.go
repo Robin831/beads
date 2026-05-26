@@ -106,6 +106,82 @@ func TestRunCompatMigrations_RunsWhenStampMissing(t *testing.T) {
 	}
 }
 
+// TestRunCompatMigrations_StampsAfterNoopRun is the regression test for the
+// "common case" bug: on a database whose schema is already current, every
+// registered migration is idempotent and produces zero dirty rows, so the
+// early-return at `dirtyCount == 0` was firing BEFORE the stamp was
+// written. That meant the stamp was never written on healthy databases —
+// and the entire skip-path added by CompatMigrationVersion was reachable
+// in theory but unreachable in practice. Caught on the local Fhi.Metadata
+// embedded DB: bd ready was still ~6-14 s per command after the perf patch
+// shipped because no stamp ever landed. Fix: stamp even when the loop
+// produced no dirty rows.
+func TestRunCompatMigrations_StampsAfterNoopRun(t *testing.T) {
+	db := openTestDoltBranch(t)
+
+	if _, err := db.Exec(
+		"CREATE TABLE IF NOT EXISTS local_metadata (`key` VARCHAR(255) PRIMARY KEY, value TEXT NOT NULL DEFAULT '')",
+	); err != nil {
+		t.Fatalf("create local_metadata: %v", err)
+	}
+
+	const testVersion = "1.0.3-nooptest"
+
+	prevVersion := CompatMigrationVersion
+	CompatMigrationVersion = testVersion
+	t.Cleanup(func() { CompatMigrationVersion = prevVersion })
+
+	// Probe migration that runs but produces no dirty rows — mirrors the
+	// real-world steady state where every migration is already applied.
+	probeRan := false
+	prevList := compatMigrationsList
+	compatMigrationsList = []CompatMigration{
+		{Name: "nooptest_probe", Func: func(*sql.DB) error {
+			probeRan = true
+			return nil
+		}},
+	}
+	t.Cleanup(func() { compatMigrationsList = prevList })
+
+	// Sanity: dolt_status starts clean.
+	var dirtyBefore int
+	if err := db.QueryRow("SELECT COUNT(*) FROM dolt_status").Scan(&dirtyBefore); err != nil {
+		t.Fatalf("read dolt_status: %v", err)
+	}
+	if dirtyBefore != 0 {
+		t.Fatalf("test precondition: expected clean dolt_status, got %d dirty rows", dirtyBefore)
+	}
+
+	if err := RunCompatMigrations(db); err != nil {
+		t.Fatalf("RunCompatMigrations returned error: %v", err)
+	}
+	if !probeRan {
+		t.Fatal("expected migration loop to run on first invocation, but probe did not run")
+	}
+
+	// Critical assertion: the stamp must be written even though no
+	// dirty rows were produced. Pre-fix, this row was absent.
+	var applied string
+	if err := db.QueryRow(
+		"SELECT value FROM local_metadata WHERE `key` = ?",
+		compatMigrationVersionKey,
+	).Scan(&applied); err != nil {
+		t.Fatalf("read stamp after noop run: %v (this is the bug — stamp missing)", err)
+	}
+	if applied != testVersion {
+		t.Fatalf("expected stamp %q after noop run, got %q", testVersion, applied)
+	}
+
+	// And the next invocation must short-circuit.
+	probeRan = false
+	if err := RunCompatMigrations(db); err != nil {
+		t.Fatalf("second RunCompatMigrations returned error: %v", err)
+	}
+	if probeRan {
+		t.Fatal("expected second invocation to short-circuit via stamp, but probe ran again")
+	}
+}
+
 // TestRunCompatMigrations_RunsWhenVersionUnset preserves backward-compatible
 // behaviour: callers that never set CompatMigrationVersion (e.g. tests that
 // don't go through cmd/bd's init) must continue to run the full migration
