@@ -58,15 +58,29 @@ Examples:
 		table := args[0]
 		ours, _ := cmd.Flags().GetBool("ours")
 		theirs, _ := cmd.Flags().GetBool("theirs")
+		auto, _ := cmd.Flags().GetBool("auto")
 		allowRowLoss, _ := cmd.Flags().GetBool("allow-row-loss")
 		message, _ := cmd.Flags().GetString("message")
 
-		if ours == theirs {
-			FatalError("exactly one of --ours or --theirs is required")
+		modeCount := 0
+		if ours {
+			modeCount++
+		}
+		if theirs {
+			modeCount++
+		}
+		if auto {
+			modeCount++
+		}
+		if modeCount != 1 {
+			FatalError("exactly one of --ours, --theirs, or --auto is required")
 		}
 		strategy := "--ours"
 		if theirs {
 			strategy = "--theirs"
+		}
+		if auto {
+			strategy = "--auto"
 		}
 
 		ctx := context.Background()
@@ -110,13 +124,47 @@ func runSafeResolve(ctx context.Context, db *sql.DB, table, strategy string, all
 		return fmt.Errorf("could not determine both merge parents; aborting to avoid an unguarded resolution")
 	}
 
-	// Run the conflict resolution. This is the same operation as
-	// `dolt conflicts resolve` but inside our transaction so we can stage
-	// + commit atomically afterwards.
-	if _, err := db.ExecContext(ctx,
-		fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE(%q, %q)", strategy, table),
-	); err != nil {
-		return fmt.Errorf("resolving conflicts on %s with %s: %w", table, strategy, err)
+	// Run the conflict resolution. For --ours/--theirs, defer to dolt's
+	// table-level resolver. For --auto, examine each conflicting row, pick
+	// the safe-shape resolution per-row (same final status + only timestamp
+	// columns differ → take the later updated_at; anything else → bail).
+	if strategy == "--auto" {
+		picks, unsafe, err := classifyConflicts(ctx, db, table)
+		if err != nil {
+			return fmt.Errorf("classifying conflicts on %s: %w", table, err)
+		}
+		if len(unsafe) > 0 {
+			preview := unsafe
+			if len(preview) > 5 {
+				preview = preview[:5]
+			}
+			return fmt.Errorf(
+				"--auto refused: %d conflict(s) on %s are not safe-shape (status mismatch or content drift on title/description/etc.).\n"+
+					"  affected ids (first %d): %s\n\n"+
+					"  inspect with: SELECT base_id, our_status, their_status FROM dolt_conflicts_%s;\n"+
+					"  resolve manually with --ours or --theirs (and confirm row-loss guard reports as expected).",
+				len(unsafe), table, len(preview), strings.Join(preview, ", "), table,
+			)
+		}
+		for id, pick := range picks {
+			pickStrategy := "--ours"
+			if pick == pickTheirs {
+				pickStrategy = "--theirs"
+			}
+			if _, err := db.ExecContext(ctx,
+				fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE(%q, %q, ?)", pickStrategy, table),
+				id,
+			); err != nil {
+				return fmt.Errorf("auto-resolving %s row %q with %s: %w", table, id, pickStrategy, err)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "auto-resolved %d safe-shape conflict(s) on %s\n", len(picks), table)
+	} else {
+		if _, err := db.ExecContext(ctx,
+			fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE(%q, %q)", strategy, table),
+		); err != nil {
+			return fmt.Errorf("resolving conflicts on %s with %s: %w", table, strategy, err)
+		}
 	}
 
 	// Stage all changes in the table, including auto-merged rows the
@@ -261,9 +309,146 @@ func firstNStrings(ss []string, n int) []string {
 	return ss[:n]
 }
 
+// pickSide enumerates which merge-parent's values the auto-resolver picks
+// for a single conflicting row.
+type pickSide int
+
+const (
+	pickOurs pickSide = iota
+	pickTheirs
+)
+
+// safeShapeContentColumns are the columns that, when they differ between
+// ours and theirs, force the auto-resolver to bail out. Differences here
+// represent real content drift that needs a human decision. Timestamps
+// (updated_at, closed_at, started_at) intentionally not on this list —
+// they routinely differ between independent edits of the same row, and
+// taking the later one is the correct heuristic.
+var safeShapeContentColumns = []string{
+	"title", "description", "design", "acceptance_criteria", "notes",
+	"assignee", "priority", "issue_type", "owner", "external_ref",
+	"close_reason", "spec_id",
+}
+
+// classifyConflicts inspects every row in dolt_conflicts_<table> and
+// categorises each as either safe-shape (same final status, only
+// timestamp columns differ — auto-resolvable by taking the side with the
+// later updated_at) or unsafe (status mismatch or content drift). Only
+// implemented for the `issues` table today; other tables fall through as
+// "no auto-resolution possible, all rows are unsafe" so the caller bails.
+//
+// Returns (picks, unsafeIDs, err) where picks is a map from row id to
+// the chosen merge-parent side.
+func classifyConflicts(ctx context.Context, db *sql.DB, table string) (map[string]pickSide, []string, error) {
+	if table != "issues" {
+		// Conservatively refuse auto-resolution on tables we haven't
+		// reasoned about. Operator must use --ours or --theirs explicitly.
+		ids, err := loadConflictRowIDs(ctx, db, table)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, ids, nil
+	}
+
+	selectCols := []string{
+		"base_id", "our_status", "their_status",
+		"our_updated_at", "their_updated_at",
+	}
+	for _, c := range safeShapeContentColumns {
+		selectCols = append(selectCols,
+			fmt.Sprintf("our_%s", c),
+			fmt.Sprintf("their_%s", c),
+		)
+	}
+	q := fmt.Sprintf("SELECT %s FROM dolt_conflicts_%s", strings.Join(selectCols, ", "), table)
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	picks := make(map[string]pickSide)
+	var unsafe []string
+
+	for rows.Next() {
+		// Dynamic-width scan: one string-ish slot per column. Use
+		// sql.NullString so NULLs come through cleanly.
+		dest := make([]any, len(selectCols))
+		nulls := make([]sql.NullString, len(selectCols))
+		for i := range dest {
+			dest[i] = &nulls[i]
+		}
+		if err := rows.Scan(dest...); err != nil {
+			return nil, nil, err
+		}
+
+		id := nulls[0].String
+		ourStatus := nulls[1].String
+		theirStatus := nulls[2].String
+		ourUpdatedAt := nulls[3].String
+		theirUpdatedAt := nulls[4].String
+
+		if ourStatus != theirStatus {
+			unsafe = append(unsafe, id)
+			continue
+		}
+
+		contentDrift := false
+		for i, c := range safeShapeContentColumns {
+			ourVal := nulls[5+2*i]
+			theirVal := nulls[5+2*i+1]
+			if ourVal.Valid != theirVal.Valid || ourVal.String != theirVal.String {
+				_ = c // (named in selectCols above; loop index is enough here)
+				contentDrift = true
+				break
+			}
+		}
+		if contentDrift {
+			unsafe = append(unsafe, id)
+			continue
+		}
+
+		// Safe shape: take whichever side has the later updated_at.
+		// String comparison works because dolt stores timestamps in
+		// ISO-8601-like sortable format ("YYYY-MM-DD HH:MM:SS...").
+		if ourUpdatedAt >= theirUpdatedAt {
+			picks[id] = pickOurs
+		} else {
+			picks[id] = pickTheirs
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return picks, unsafe, nil
+}
+
+// loadConflictRowIDs returns the list of base_id values currently in
+// dolt_conflicts_<table>. Used by classifyConflicts when bailing on
+// a table it doesn't auto-handle.
+func loadConflictRowIDs(ctx context.Context, db *sql.DB, table string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT base_id FROM dolt_conflicts_%s", table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id sql.NullString
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if id.Valid {
+			ids = append(ids, id.String)
+		}
+	}
+	return ids, rows.Err()
+}
+
 func init() {
 	doltResolveCmd.Flags().Bool("ours", false, "Keep our (target branch) values for conflicting rows")
 	doltResolveCmd.Flags().Bool("theirs", false, "Take their (source branch) values for conflicting rows")
+	doltResolveCmd.Flags().Bool("auto", false, "Auto-resolve per-row: same-final-status + only timestamps differ → take later updated_at; anything else → bail")
 	doltResolveCmd.Flags().Bool("allow-row-loss", false, "Allow the commit even when rows on the merge parents will be dropped (override the safety guard)")
 	doltResolveCmd.Flags().StringP("message", "m", "", "Commit message (default: auto-generated)")
 	doltCmd.AddCommand(doltResolveCmd)
