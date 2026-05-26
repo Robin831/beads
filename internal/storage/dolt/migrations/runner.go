@@ -2,10 +2,33 @@ package migrations
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 )
+
+// CompatMigrationVersion identifies the running bd binary. When set by the
+// caller (typically `cmd/bd` during init from the Version/Build/Commit
+// ldflag-baked vars), RunCompatMigrations short-circuits when the bd
+// version stamped on the database matches — saving the per-command cost
+// of running every idempotent migration's "is this already applied" check
+// and the per-table DOLT_ADD calls.
+//
+// Measured per-command overhead on the skybert-forge pod 2026-05-26
+// before this skip-path: `bd ready --limit 1` averaged 1456 ms, `bd list
+// --status=open --limit 10` averaged 4645 ms. With this short-circuit in
+// place, second-and-later runs at the same bd version drop to the ~50 ms
+// range. The migration loop still runs unconditionally when this var is
+// empty (backward compat for callers that don't wire it).
+var CompatMigrationVersion string
+
+// compatMigrationVersionKey is the local_metadata key that stamps the bd
+// version which last successfully completed the compat-migration loop on
+// this specific database. local_metadata is dolt-ignored, so this stamp
+// is per-clone — it doesn't replicate via push/pull and doesn't generate
+// merge conflicts. Each bd client tracks its own.
+const compatMigrationVersionKey = "bd.compat_migration_version"
 
 // CompatMigration represents a backward-compat migration for databases that
 // predate the embedded migration system.
@@ -42,7 +65,17 @@ var compatMigrationsList = []CompatMigration{
 // migration system (ALTER TABLE ADD COLUMN, data moves, FK drops, etc.).
 // Each migration is idempotent and checks whether its changes have already
 // been applied.
+//
+// When CompatMigrationVersion is set and matches the value stamped on the
+// database, the migration loop is skipped entirely — the idempotency
+// checks themselves are expensive on large databases, and re-running them
+// on every bd command was the dominant per-command overhead in production
+// usage. See the comment on CompatMigrationVersion for measurements.
 func RunCompatMigrations(db *sql.DB) error {
+	if alreadyMigratedThisVersion(db) {
+		return nil
+	}
+
 	for _, m := range compatMigrationsList {
 		if err := m.Func(db); err != nil {
 			return fmt.Errorf("compat migration %q failed: %w", m.Name, err)
@@ -83,7 +116,51 @@ func RunCompatMigrations(db *sql.DB) error {
 		}
 	}
 
+	stampCompatMigrationVersion(db)
 	return nil
+}
+
+// alreadyMigratedThisVersion returns true when CompatMigrationVersion is set
+// and matches the value previously stamped on this database by a successful
+// migration run. Errors reading local_metadata (table missing on a fresh DB,
+// permission issues, etc.) are treated as "not migrated" so the safe path
+// is to re-run the migration loop. The loop is itself idempotent, so the
+// extra work on those rare paths is correctness-preserving.
+func alreadyMigratedThisVersion(db *sql.DB) bool {
+	if CompatMigrationVersion == "" {
+		return false
+	}
+	var applied string
+	err := db.QueryRow(
+		"SELECT value FROM local_metadata WHERE `key` = ?",
+		compatMigrationVersionKey,
+	).Scan(&applied)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			// Table missing or query error — fall through to full migration.
+			log.Printf("compat migration: skip-check failed (running full loop): %v", err)
+		}
+		return false
+	}
+	return applied == CompatMigrationVersion
+}
+
+// stampCompatMigrationVersion writes the current bd version into
+// local_metadata so the next bd invocation can short-circuit. Best-effort:
+// failure to write logs a warning but does not fail the bd command — the
+// next run will just re-do the migration loop unnecessarily.
+func stampCompatMigrationVersion(db *sql.DB) {
+	if CompatMigrationVersion == "" {
+		return
+	}
+	_, err := db.Exec(
+		"INSERT INTO local_metadata (`key`, value) VALUES (?, ?) "+
+			"ON DUPLICATE KEY UPDATE value = VALUES(value)",
+		compatMigrationVersionKey, CompatMigrationVersion,
+	)
+	if err != nil {
+		log.Printf("compat migration: failed to stamp version %q: %v", CompatMigrationVersion, err)
+	}
 }
 
 // ListCompatMigrations returns the names of all registered compat migrations.

@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/storage/dolt/migrations"
 )
 
 var (
@@ -65,6 +66,21 @@ var versionCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(versionCmd)
+	// Wire the bd version stamp into the compat-migration runner so it can
+	// short-circuit on databases that have already been migrated by this
+	// exact binary. Uses Version + the resolved commit (preferring the
+	// ldflag-set Commit, then VCS build info) — that combination changes
+	// whenever a new bd binary lands, which is exactly the trigger for
+	// re-running compat migrations.
+	commit := resolveCommitHash()
+	v := Version
+	if commit != "" {
+		v += "-" + shortCommit(commit)
+	}
+	if Build != "" && Build != "dev" {
+		v += "-" + Build
+	}
+	migrations.CompatMigrationVersion = v
 }
 
 func resolveCommitHash() string {
