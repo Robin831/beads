@@ -146,6 +146,25 @@ func maybeAutoPull(ctx context.Context, cmdName string) {
 	pullCtx, pullCancel := context.WithTimeout(ctx, pullTimeout)
 	defer pullCancel()
 
+	// Flush any uncommitted working-set changes before pulling. A dirty
+	// working set makes the pull's merge fail with "cannot merge with
+	// uncommitted changes", which strands every subsequent auto-pull until
+	// someone hand-commits — observed repeatedly on the skybert-forge pod and
+	// dev laptops (escaped writes left issues+events modified, blocking sync
+	// so newly-created beads never propagated). Only do this in auto-commit
+	// "on" mode: there, every write is supposed to commit immediately, so a
+	// dirty tree is definitively an escaped write and committing it is the
+	// correct recovery. In "batch" mode a dirty tree is intentional
+	// accumulation and must not be prematurely committed; in "off" mode the
+	// intent is ambiguous, so we leave it alone and let the pull fail as before.
+	if mode, modeErr := getDoltAutoCommitMode(); modeErr == nil && mode == doltAutoCommitOn {
+		if committed, cErr := st.CommitPending(pullCtx, getActor()); cErr != nil {
+			debug.Logf("dolt auto-pull: pre-pull CommitPending failed (proceeding anyway): %v\n", cErr)
+		} else if committed {
+			debug.Logf("dolt auto-pull: committed escaped working-set changes before pull\n")
+		}
+	}
+
 	debug.Logf("dolt auto-pull: pulling from origin (timeout %s)...\n", pullTimeout)
 	pullErr := tryRemoteCLIPushPull(pullCtx, "pull", "origin", "")
 	if errors.Is(pullErr, errRemoteCLINotApplicable) {
