@@ -88,18 +88,32 @@ Examples:
 		if st == nil {
 			FatalError("no store available")
 		}
+		inner := storage.UnwrapStore(st)
 
-		db, ok := storage.UnwrapStore(st).(interface{ DB() *sql.DB })
-		if !ok || db == nil {
+		// Embedded mode (the common case: laptop + pod) exposes no persistent
+		// *sql.DB — connections are short-lived and opened on demand. Drive the
+		// resolve through WithConflictDB, which hands us a single-connection
+		// handle scoped to the merge working set and cleans it up afterward.
+		// Server mode exposes a long-lived *sql.DB via DB(); use that directly.
+		switch backend := inner.(type) {
+		case interface {
+			WithConflictDB(context.Context, func(*sql.DB) error) error
+		}:
+			if err := backend.WithConflictDB(ctx, func(db *sql.DB) error {
+				return runSafeResolve(ctx, db, table, strategy, allowRowLoss, message)
+			}); err != nil {
+				FatalError("%v", err)
+			}
+		case interface{ DB() *sql.DB }:
+			sqlDB := backend.DB()
+			if sqlDB == nil {
+				FatalError("database handle is nil")
+			}
+			if err := runSafeResolve(ctx, sqlDB, table, strategy, allowRowLoss, message); err != nil {
+				FatalError("%v", err)
+			}
+		default:
 			FatalError("storage backend does not expose a database handle; run from an embedded-mode workspace or with dolt server connection configured")
-		}
-		sqlDB := db.DB()
-		if sqlDB == nil {
-			FatalError("database handle is nil")
-		}
-
-		if err := runSafeResolve(ctx, sqlDB, table, strategy, allowRowLoss, message); err != nil {
-			FatalError("%v", err)
 		}
 	},
 }
@@ -225,15 +239,43 @@ func runSafeResolve(ctx context.Context, db *sql.DB, table, strategy string, all
 // mergeInProgress returns true when the session/branch is sitting in the
 // middle of an unresolved merge (whether a conflict exists or not).
 func mergeInProgress(ctx context.Context, db *sql.DB) (bool, error) {
-	var isMerging int
-	err := db.QueryRowContext(ctx, "SELECT is_merging FROM dolt_merge_status").Scan(&isMerging)
+	// dolt_merge_status.is_merging comes back as an int (0/1) from the
+	// dolt sql-server driver but as a Go bool from the embedded dolt driver.
+	// Scan into `any` and coerce so the same code works in both modes —
+	// scanning a bool driver value into an int (the old code) failed under
+	// embedded mode with "converting driver.Value type bool to a int".
+	var raw any
+	err := db.QueryRowContext(ctx, "SELECT is_merging FROM dolt_merge_status").Scan(&raw)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		return false, err
 	}
-	return isMerging != 0, nil
+	return driverTruthy(raw), nil
+}
+
+// driverTruthy coerces a SQL driver value into a bool, tolerating the
+// different concrete Go types the dolt sql-server driver (int64) and the
+// embedded dolt driver (bool) return for the same boolean column. Strings
+// and byte slices ("1"/"true") are also handled for robustness.
+func driverTruthy(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case int64:
+		return t != 0
+	case int:
+		return t != 0
+	case []byte:
+		s := strings.ToLower(strings.TrimSpace(string(t)))
+		return s == "1" || s == "true"
+	case string:
+		s := strings.ToLower(strings.TrimSpace(t))
+		return s == "1" || s == "true"
+	default:
+		return false
+	}
 }
 
 // mergeParents returns (target, source) commit hashes for the in-progress

@@ -229,6 +229,37 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 	return
 }
 
+// WithConflictDB opens a single-connection *sql.DB bound to the store's data
+// directory (and thus the checked-out HEAD branch — the DSN does not pin a
+// branch, so the connection sees whatever branch is active on disk, which is
+// the branch bd actually syncs on) and passes the raw handle to fn.
+//
+// Unlike withConn, fn receives the *sql.DB itself rather than a single *sql.Tx.
+// This is required by `bd dolt resolve`, whose flow spans multiple
+// autocommitted statements against the merge working set — CALL
+// DOLT_CONFLICTS_RESOLVE, DOLT_ADD, DOLT_COMMIT, plus reads of
+// dolt_merge_status / dolt_conflicts_* — which cannot be wrapped in one
+// explicit transaction (the CALL procedures mutate the persisted working set,
+// not transaction-local state). OpenSQL already caps the pool at one
+// connection, so the whole sequence runs on a single session even though it is
+// driven through a *sql.DB. The connection (and the embedded engine resources
+// behind it) are closed when fn returns, regardless of outcome.
+func (s *EmbeddedDoltStore) WithConflictDB(ctx context.Context, fn func(*sql.DB) error) (err error) {
+	if s.closed.Load() {
+		return errClosed
+	}
+	var db *sql.DB
+	var cleanup func() error
+	db, cleanup, err = OpenSQL(ctx, s.dataDir, s.database, s.branch)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, cleanup())
+	}()
+	return fn(db)
+}
+
 // initSchema creates the database (if needed) and runs all pending migrations,
 // committing them to Dolt history. Uses withRootConn so the database can be
 // created before USE; this avoids running CREATE DATABASE inside withConn,
