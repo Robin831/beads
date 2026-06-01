@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 )
@@ -216,6 +217,14 @@ func (s *EmbeddedDoltStore) Push(ctx context.Context) error {
 }
 
 func (s *EmbeddedDoltStore) Pull(ctx context.Context) error {
+	// FHI fork: transparently resolve the safe, recurring conflict shapes
+	// (metadata --theirs, issues by later updated_at) on pull so a shared
+	// sync branch with multiple writers doesn't wedge on every worker-claim
+	// race. Disable via dolt.auto-resolve-conflicts=false to require manual
+	// `bd dolt resolve` for every conflict.
+	if config.GetBool("dolt.auto-resolve-conflicts") {
+		return s.pullWithAutoResolve(ctx, defaultRemote, s.branch, remoteAuthUser())
+	}
 	return s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
 		return versioncontrolops.Pull(ctx, db, defaultRemote, s.branch, remoteAuthUser())
 	})

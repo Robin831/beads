@@ -185,6 +185,21 @@ func Initialize() error {
 	// Values: off | on
 	v.SetDefault("dolt.auto-commit", "on")
 
+	// Auto-resolve safe merge conflicts during pull (FHI fork). When true, an
+	// embedded-mode pull that hits conflicts on the metadata or issues tables
+	// resolves them transparently: metadata takes --theirs, and issues take the
+	// side with the later updated_at (the common worker-claim race: open locally
+	// vs in_progress on the remote). Any other table, a delete/modify, or an
+	// equal/missing timestamp is left unresolved for manual `bd dolt resolve`.
+	// The overwritten side is preserved in Dolt history.
+	//
+	// Defaults to FALSE deliberately: this silently discards the losing edit on
+	// every auto-pull, so it stays inert until validated against a real conflict
+	// (the hermetic embedded-conflict test is still pending — see
+	// pull_autoresolve_test.go) and then explicitly enabled with
+	// `bd config set dolt.auto-resolve-conflicts true`.
+	v.SetDefault("dolt.auto-resolve-conflicts", false)
+
 	// Routing configuration defaults
 	v.SetDefault("routing.mode", "")
 	v.SetDefault("routing.default", ".")
