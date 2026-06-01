@@ -1145,6 +1145,12 @@ var rootCmd = &cobra.Command{
 		// Sync all state to CommandContext for unified access.
 		syncCommandContext()
 
+		// Auto-pull: fetch latest from the Dolt remote if enabled and the
+		// debounce interval has passed. Runs BEFORE the command so reads see
+		// fresh data and writes don't immediately diverge from upstream. Mirrors
+		// the post-run maybeAutoPush hook. No-op unless dolt.auto-pull=true.
+		maybeAutoPull(rootCtx, cmd.Name())
+
 		// Tips (including sync conflict proactive checks) are shown via maybeShowTip()
 		// after successful command execution, not in PreRun
 	},
