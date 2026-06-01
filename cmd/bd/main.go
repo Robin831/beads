@@ -1849,6 +1849,14 @@ var rootCmd = &cobra.Command{
 					runPostRunAutoPush(rootCtx)
 				}
 
+				// Auto GitHub sync: push the changed issue to GitHub if enabled.
+				// Runs after backup/export so external_ref writes from auto-sync are
+				// included. Use GetLastTouchedIDThisRun (in-memory) rather than
+				// GetLastTouchedID (file) so read-only commands do not inherit a stale
+				// ID from a previous write command and trigger a full sync on every
+				// bd ready/list/show.
+				maybeAutoGitHubSync(rootCtx, GetLastTouchedIDThisRun())
+
 				// Events-journal retention, LAST in the maintenance net. It is
 				// the only step here that serves nobody but the database
 				// itself, so everything the user can observe — the commit, the

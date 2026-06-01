@@ -376,8 +376,11 @@ var showCmd = &cobra.Command{
 			return SilentExit()
 		}
 
+		// Records the viewed ID persistently only — deliberately NOT via the
+		// in-process last-touched path, because that is what triggers GitHub
+		// auto-sync. bd show is read-only and must not fire a sync.
 		if len(args) > 0 {
-			SetLastTouchedID(args[0])
+			RecordViewedID(args[0])
 		}
 		return nil
 	},
