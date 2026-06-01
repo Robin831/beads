@@ -643,6 +643,14 @@ reports conflicts.`,
 		if st == nil {
 			return HandleError("no store available")
 		}
+		// Flush any escaped working-set writes before the pull's merge so an
+		// explicit `bd dolt pull` self-heals the "cannot merge with uncommitted
+		// changes" stall the same way the auto-pull hook does (auto-commit=on
+		// only). Best-effort: on error we fall through and let the pull surface
+		// the real problem.
+		if committed, _ := flushEscapedWritesBeforePull(ctx, st); committed && !isQuiet() {
+			fmt.Println("Committed uncommitted working-set changes before pull.")
+		}
 		remote, _ := cmd.Flags().GetString("remote")
 		strategy, _ := cmd.Flags().GetString("strategy")
 		if strategy != "" {
