@@ -506,6 +506,33 @@ func (s *EmbeddedDoltStore) CommitPending(ctx context.Context, actor string) (bo
 	return true, nil
 }
 
+// WithConflictDB opens a single-connection *sql.DB bound to the store's data
+// directory (and thus the checked-out HEAD branch — the DSN does not pin a
+// branch) and passes the raw handle to fn. Unlike withConn, fn receives the
+// *sql.DB itself rather than a single *sql.Tx. Required by `bd dolt resolve`,
+// whose flow spans multiple autocommitted statements against the merge working
+// set — CALL DOLT_CONFLICTS_RESOLVE / DOLT_ADD / DOLT_COMMIT plus reads of
+// dolt_merge_status / dolt_conflicts_* — which cannot be wrapped in one explicit
+// transaction (the CALL procedures mutate the persisted working set, not
+// transaction-local state). OpenSQL caps the pool at one connection, so the
+// whole sequence runs on a single session. The connection (and the embedded
+// engine resources behind it) are closed when fn returns.
+func (s *EmbeddedDoltStore) WithConflictDB(ctx context.Context, fn func(*sql.DB) error) (err error) {
+	if s.closed.Load() {
+		return errClosed
+	}
+	var db *sql.DB
+	var cleanup func() error
+	db, cleanup, err = OpenSQL(ctx, s.dataDir, s.database, s.branch)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, cleanup())
+	}()
+	return fn(db)
+}
+
 // CommitExists is implemented in version_control.go via versioncontrolops.
 
 func (s *EmbeddedDoltStore) GetCurrentCommit(ctx context.Context) (string, error) {
