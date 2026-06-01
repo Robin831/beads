@@ -306,6 +306,15 @@ The remote must already exist (see 'bd dolt remote add').`,
 			fmt.Fprintf(os.Stderr, "Error: no store available\n")
 			os.Exit(1)
 		}
+		// Flush any escaped working-set writes before the pull's merge so an
+		// explicit `bd dolt pull` self-heals the "cannot merge with uncommitted
+		// changes" stall the same way the auto-pull hook does (auto-commit=on
+		// only). Without this, a stray uncommitted row blocks the pull until
+		// someone hand-commits. Best-effort: on a CommitPending error we fall
+		// through and let the pull surface the real problem.
+		if committed, _ := flushEscapedWritesBeforePull(ctx, st); committed && !isQuiet() {
+			fmt.Println("Committed uncommitted working-set changes before pull.")
+		}
 		remote, _ := cmd.Flags().GetString("remote")
 		if remote != "" {
 			fmt.Printf("Pulling from Dolt remote %q...\n", remote)
