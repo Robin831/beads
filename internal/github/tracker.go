@@ -133,6 +133,16 @@ func (t *Tracker) FetchIssue(ctx context.Context, identifier string) (*tracker.T
 }
 
 func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker.TrackerIssue, error) {
+	// Idempotency guard: check for an existing open issue with this title before creating.
+	// This prevents duplicates when external_ref was not saved after a previous create
+	// (e.g. due to a race condition or transient write failure).
+	existing, err := t.client.SearchOpenIssuesByTitle(ctx, issue.Title)
+	if err == nil && len(existing) > 0 {
+		// Return the first match — the caller will save this as external_ref.
+		ti := githubToTrackerIssue(&existing[0])
+		return &ti, nil
+	}
+
 	fields := BeadsIssueToGitHubFields(issue, t.config)
 	labels, _ := fields["labels"].([]string)
 
@@ -216,9 +226,28 @@ func (t *Tracker) getConfig(ctx context.Context, key, envVar string) string {
 	if err == nil && val != "" {
 		return val
 	}
+	return envFallback(key, envVar)
+}
+
+// envFallback returns the env-var fallback for a github config key. For
+// github.token it also accepts GH_TOKEN — the canonical env var the gh CLI
+// sets and the one most modern dev workflows export. Mirrors the fallback in
+// cmd/bd/github.go:getGitHubConfigValue (commits 8c2e26fb / a3602334) so that
+// Tracker.Init — invoked by `bd create` autosync — honours GH_TOKEN the same
+// way `bd github status` already does. Without this, deployments whose
+// process env only has GH_TOKEN (gh CLI, GitHub Actions, kubernetes pods
+// that wire only GH_TOKEN from a secret — e.g. skybert-forge) report
+// "Configured" via `bd github status` yet silently no-op on every `bd create`
+// autosync, leaving beads without linked GitHub issues.
+func envFallback(key, envVar string) string {
 	if envVar != "" {
-		if envVal := os.Getenv(envVar); envVal != "" {
-			return envVal
+		if v := os.Getenv(envVar); v != "" {
+			return v
+		}
+	}
+	if key == "github.token" {
+		if v := os.Getenv("GH_TOKEN"); v != "" {
+			return v
 		}
 	}
 	return ""

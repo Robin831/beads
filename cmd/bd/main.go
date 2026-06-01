@@ -1204,6 +1204,14 @@ var rootCmd = &cobra.Command{
 				}
 			}
 
+			// Auto GitHub sync: push the changed issue to GitHub if enabled.
+			// Runs after backup/export so external_ref writes from auto-sync are
+			// included. Use GetLastTouchedIDThisRun (in-memory) rather than
+			// GetLastTouchedID (file) so read-only commands don't inherit a stale
+			// ID from a previous write command and trigger a full sync on every
+			// bd ready/list/show.
+			maybeAutoGitHubSync(rootCtx, GetLastTouchedIDThisRun())
+
 			// Auto-push: push to Dolt remote if enabled and due.
 			// Skip for read-only commands to avoid unnecessary network operations
 			// and metadata writes on commands like bd list/show/ready (GH#2191).

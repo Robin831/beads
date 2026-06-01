@@ -69,12 +69,14 @@ var githubReposCmd = &cobra.Command{
 }
 
 var (
-	githubSyncDryRun   bool
-	githubSyncPullOnly bool
-	githubSyncPushOnly bool
-	githubPreferLocal  bool
-	githubPreferGitHub bool
-	githubPreferNewer  bool
+	githubSyncDryRun       bool
+	githubSyncPullOnly     bool
+	githubSyncPushOnly     bool
+	githubSyncPushOpenOnly bool
+	githubSyncCloseOnly    bool
+	githubPreferLocal      bool
+	githubPreferGitHub     bool
+	githubPreferNewer      bool
 )
 
 // GitHubConflictStrategy defines how to resolve conflicts between local and GitHub versions.
@@ -147,6 +149,8 @@ func init() {
 	githubSyncCmd.Flags().BoolVar(&githubSyncDryRun, "dry-run", false, "Show what would be synced without making changes")
 	githubSyncCmd.Flags().BoolVar(&githubSyncPullOnly, "pull-only", false, "Only pull issues from GitHub")
 	githubSyncCmd.Flags().BoolVar(&githubSyncPushOnly, "push-only", false, "Only push issues to GitHub")
+	githubSyncCmd.Flags().BoolVar(&githubSyncPushOpenOnly, "push-open-only", false, "Only push open/in-progress beads to GitHub (skip closed)")
+	githubSyncCmd.Flags().BoolVar(&githubSyncCloseOnly, "close-only", false, "Close local beads whose linked GitHub issues are closed (never creates new beads)")
 
 	// Conflict resolution flags (mutually exclusive)
 	githubSyncCmd.Flags().BoolVar(&githubPreferLocal, "prefer-local", false, "On conflict, keep local beads version")
@@ -200,6 +204,17 @@ func getGitHubConfigValue(ctx context.Context, key string) string {
 				return value
 			}
 		}
+		// Same GH_TOKEN secondary fallback as the post-store branch below.
+		// github.token is a yaml-only key, so it reaches THIS branch and
+		// never the post-store fallback below — without this duplicate,
+		// autosync silently no-ops on any deployment whose process env
+		// only has GH_TOKEN (gh CLI, GitHub Actions, kubernetes pods that
+		// wire only GH_TOKEN from a secret).
+		if key == "github.token" {
+			if value := os.Getenv("GH_TOKEN"); value != "" {
+				return value
+			}
+		}
 		return ""
 	}
 
@@ -228,6 +243,19 @@ func getGitHubConfigValue(ctx context.Context, key string) string {
 		}
 	}
 
+	// Secondary fallback for github.token only: accept GH_TOKEN, the
+	// canonical env var the gh CLI sets via `gh auth login` and the one
+	// most modern dev workflows export. The primary GITHUB_TOKEN lookup
+	// above is preserved, so anyone who already has GITHUB_TOKEN set
+	// keeps the same behaviour. Scoped narrowly to github.token — the
+	// gh CLI doesn't set GH_OWNER / GH_REPO, so the other config keys
+	// gain nothing from a similar fallback and could mislead.
+	if key == "github.token" {
+		if value := os.Getenv("GH_TOKEN"); value != "" {
+			return value
+		}
+	}
+
 	return ""
 }
 
@@ -252,7 +280,7 @@ func githubConfigToEnvVar(key string) string {
 // validateGitHubConfig checks that required configuration is present.
 func validateGitHubConfig(config GitHubConfig) error {
 	if config.Token == "" {
-		return fmt.Errorf("github.token is not configured. Set via 'bd config set github.token <token>' or GITHUB_TOKEN environment variable")
+		return fmt.Errorf("github.token is not configured. Set via 'bd config set github.token <token>', or the GITHUB_TOKEN or GH_TOKEN environment variable")
 	}
 	if config.Owner == "" {
 		return fmt.Errorf("github.owner is not configured. Set via 'bd config set github.owner <owner>' or GITHUB_OWNER environment variable")
@@ -314,7 +342,7 @@ func runGitHubStatus(cmd *cobra.Command, args []string) error {
 func runGitHubRepos(cmd *cobra.Command, args []string) error {
 	config := getGitHubConfig()
 	if config.Token == "" {
-		return fmt.Errorf("github.token is not configured. Set via 'bd config set github.token <token>' or GITHUB_TOKEN environment variable")
+		return fmt.Errorf("github.token is not configured. Set via 'bd config set github.token <token>', or the GITHUB_TOKEN or GH_TOKEN environment variable")
 	}
 
 	out := cmd.OutOrStdout()
@@ -342,6 +370,23 @@ func runGitHubRepos(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// buildGitHubEngine creates and initialises a tracker Engine for GitHub.
+// out may be nil (messages are silently dropped).
+func buildGitHubEngine(ctx context.Context, out interface{ Write([]byte) (int, error) }) (*tracker.Engine, error) {
+	gt := &github.Tracker{}
+	if err := gt.Init(ctx, store); err != nil {
+		return nil, fmt.Errorf("initializing GitHub tracker: %w", err)
+	}
+
+	engine := tracker.NewEngine(gt, store, actor)
+	if out != nil {
+		engine.OnMessage = func(msg string) { _, _ = fmt.Fprintln(out, "  "+msg) }
+	}
+	engine.OnWarning = func(msg string) { _, _ = fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
+	engine.PullHooks = buildGitHubPullHooks(ctx)
+	return engine, nil
 }
 
 // runGitHubSync implements the github sync command.
@@ -373,28 +418,23 @@ func runGitHubSync(cmd *cobra.Command, args []string) error {
 	out := cmd.OutOrStdout()
 	ctx := context.Background()
 
-	// Create and initialize the GitHub tracker
-	gt := &github.Tracker{}
-	if err := gt.Init(ctx, store); err != nil {
-		return fmt.Errorf("initializing GitHub tracker: %w", err)
+	engine, err := buildGitHubEngine(ctx, out)
+	if err != nil {
+		return err
 	}
 
-	// Create the sync engine
-	engine := tracker.NewEngine(gt, store, actor)
-	engine.OnMessage = func(msg string) { _, _ = fmt.Fprintln(out, "  "+msg) }
-	engine.OnWarning = func(msg string) { _, _ = fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
-
-	// Set up GitHub-specific pull hooks
-	engine.PullHooks = buildGitHubPullHooks(ctx)
-
 	// Build sync options from CLI flags
-	pull := !githubSyncPushOnly
-	push := !githubSyncPullOnly
+	pull := !githubSyncPushOnly && !githubSyncCloseOnly
+	push := !githubSyncPullOnly && !githubSyncCloseOnly
 
 	opts := tracker.SyncOptions{
-		Pull:   pull,
-		Push:   push,
-		DryRun: githubSyncDryRun,
+		Pull:      pull,
+		Push:      push,
+		CloseOnly: githubSyncCloseOnly,
+		DryRun:    githubSyncDryRun,
+	}
+	if githubSyncPushOpenOnly {
+		opts.State = "open"
 	}
 
 	if err := applySelectiveSyncFlags(cmd, &opts, push); err != nil {

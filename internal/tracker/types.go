@@ -74,6 +74,10 @@ type SyncOptions struct {
 	DryRun bool
 	// CreateOnly only creates new issues, doesn't update existing.
 	CreateOnly bool
+	// CloseOnly only closes local beads whose linked external issues are closed.
+	// Unlike Pull, it does NOT create new beads for unknown external issues.
+	// This is the safe post-merge sync: PR merged → issue closed → bead closed.
+	CloseOnly bool
 	// State filters issues: "open", "closed", or "all".
 	State string
 	// ConflictResolution specifies how to handle bidirectional conflicts.

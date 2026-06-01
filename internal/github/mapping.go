@@ -151,9 +151,13 @@ func GitHubIssueToBeads(gh *Issue, config *MappingConfig) *IssueConversion {
 
 // BeadsIssueToGitHubFields converts a beads Issue to GitHub API update fields.
 func BeadsIssueToGitHubFields(issue *types.Issue, config *MappingConfig) map[string]interface{} {
+	body := issue.Description
+	if issue.ID != "" {
+		body += "\n\n<!-- Bead: " + issue.ID + " -->"
+	}
 	fields := map[string]interface{}{
 		"title": issue.Title,
-		"body":  issue.Description,
+		"body":  body,
 	}
 
 	// Build labels from type, priority, and status

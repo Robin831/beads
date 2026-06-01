@@ -97,6 +97,41 @@ func TestBuildExternalRef(t *testing.T) {
 	}
 }
 
+// TestEnvFallbackGHToken verifies that envFallback honours GH_TOKEN as a
+// secondary fallback for github.token, matching the cmd-package behaviour.
+// This is the path Tracker.Init takes during `bd create` autosync — broken in
+// the skybert-forge pod (GH_TOKEN only) until the fallback was mirrored here.
+func TestEnvFallbackGHToken(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+
+	if got := envFallback("github.token", "GITHUB_TOKEN"); got != "" {
+		t.Fatalf("baseline: expected empty, got %q", got)
+	}
+
+	t.Setenv("GH_TOKEN", "ghp_gh_only")
+	if got := envFallback("github.token", "GITHUB_TOKEN"); got != "ghp_gh_only" {
+		t.Errorf("GH_TOKEN-only: got %q, want %q", got, "ghp_gh_only")
+	}
+
+	// GITHUB_TOKEN takes precedence when both set.
+	t.Setenv("GITHUB_TOKEN", "ghp_github_primary")
+	if got := envFallback("github.token", "GITHUB_TOKEN"); got != "ghp_github_primary" {
+		t.Errorf("both set: got %q, want %q", got, "ghp_github_primary")
+	}
+
+	// GH_TOKEN fallback is scoped to github.token only — github.owner / .repo
+	// must not pick it up (gh CLI doesn't set GH_OWNER / GH_REPO).
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "should-not-leak")
+	if got := envFallback("github.owner", "GITHUB_OWNER"); got != "" {
+		t.Errorf("github.owner must not pick up GH_TOKEN, got %q", got)
+	}
+	if got := envFallback("github.repo", "GITHUB_REPO"); got != "" {
+		t.Errorf("github.repo must not pick up GH_TOKEN, got %q", got)
+	}
+}
+
 func TestFieldMapperStatus(t *testing.T) {
 	m := &githubFieldMapper{config: DefaultMappingConfig()}
 
