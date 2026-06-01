@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
@@ -516,11 +517,27 @@ func (s *EmbeddedDoltStore) Pull(ctx context.Context) error {
 		return fmt.Errorf("commit pending before pull: %w", err)
 	}
 	preHead := s.preMergeHead(ctx)
-	err := s.withPeerAuth(ctx, defaultRemote, func(user string) error {
-		return s.withMutatingPinnedDBConn(ctx, func(db versioncontrolops.DBConn) error {
-			return vcPull(ctx, db, defaultRemote, s.branch, user)
+
+	// FHI fork: transparently resolve the safe, recurring conflict shapes
+	// (metadata --theirs, issues by later updated_at) on pull so a shared sync
+	// branch with multiple writers doesn't wedge on every worker-claim race.
+	// Disable via dolt.auto-resolve-conflicts=false to require manual
+	// `bd dolt resolve` for every conflict.
+	//
+	// Deliberately sequenced INSIDE upstream's Pull rather than short-circuiting
+	// it: the commit-pending above and the blocked-recompute below are
+	// invariants of a pull, not of the merge strategy, so the gate swaps only
+	// the merge itself. Returning early here would silently drop both.
+	var err error
+	if config.GetBool("dolt.auto-resolve-conflicts") {
+		err = s.pullWithAutoResolve(ctx, defaultRemote, s.branch, remoteAuthUser())
+	} else {
+		err = s.withPeerAuth(ctx, defaultRemote, func(user string) error {
+			return s.withMutatingPinnedDBConn(ctx, func(db versioncontrolops.DBConn) error {
+				return vcPull(ctx, db, defaultRemote, s.branch, user)
+			})
 		})
-	})
+	}
 	if err != nil {
 		return err
 	}
