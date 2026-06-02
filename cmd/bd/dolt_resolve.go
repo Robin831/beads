@@ -160,17 +160,46 @@ func runSafeResolve(ctx context.Context, db *sql.DB, table, strategy string, all
 				len(unsafe), table, len(preview), strings.Join(preview, ", "), table,
 			)
 		}
-		for id, pick := range picks {
-			pickStrategy := "--ours"
+		// Resolve whole-table rather than per-PK. The 3-arg per-row form
+		// CALL DOLT_CONFLICTS_RESOLVE(strategy, table, pk) is not supported by
+		// all dolt versions (fails with "table not found"), so instead we
+		// pre-patch the working-tree rows where theirs is the newer side to
+		// theirs' values, then resolve the whole table with --ours. classify
+		// has already guaranteed every conflicting row is safe-shape (same
+		// status + content, only timestamps differ), and its pick rule —
+		// later updated_at wins, ties to ours — is exactly the WHERE below.
+		// This mirrors the embedded pull-time auto-resolver.
+		theirsWins := 0
+		for _, pick := range picks {
 			if pick == pickTheirs {
-				pickStrategy = "--theirs"
+				theirsWins++
 			}
-			if _, err := db.ExecContext(ctx,
-				fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE(%q, %q, ?)", pickStrategy, table),
-				id,
-			); err != nil {
-				return fmt.Errorf("auto-resolving %s row %q with %s: %w", table, id, pickStrategy, err)
+		}
+		if theirsWins > 0 {
+			cols, err := tableNonPKColumns(ctx, db, table)
+			if err != nil {
+				return fmt.Errorf("looking up %s columns: %w", table, err)
 			}
+			if len(cols) == 0 {
+				return fmt.Errorf("no non-PK columns found for %s — schema lookup empty", table)
+			}
+			setClauses := make([]string, 0, len(cols))
+			for _, col := range cols {
+				setClauses = append(setClauses, fmt.Sprintf("t.`%s` = c.`their_%s`", col, col))
+			}
+			upd := fmt.Sprintf(
+				"UPDATE `%s` t JOIN dolt_conflicts_%s c ON t.id = COALESCE(c.our_id, c.their_id) "+
+					"SET %s WHERE c.their_updated_at > c.our_updated_at",
+				table, table, strings.Join(setClauses, ", "),
+			)
+			if _, err := db.ExecContext(ctx, upd); err != nil {
+				return fmt.Errorf("applying theirs to %s working tree: %w", table, err)
+			}
+		}
+		if _, err := db.ExecContext(ctx,
+			fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE('--ours', %q)", table),
+		); err != nil {
+			return fmt.Errorf("auto-resolving %s (whole-table --ours after pre-patch): %w", table, err)
 		}
 		fmt.Fprintf(os.Stderr, "auto-resolved %d safe-shape conflict(s) on %s\n", len(picks), table)
 	} else {
@@ -463,6 +492,33 @@ func classifyConflicts(ctx context.Context, db *sql.DB, table string) (map[strin
 		return nil, nil, err
 	}
 	return picks, unsafe, nil
+}
+
+// tableNonPKColumns returns the column names of <table> except the primary
+// key `id`, in ordinal order. Used by --auto to build the "copy theirs into
+// the working tree" UPDATE for rows where theirs is the newer side.
+func tableNonPKColumns(ctx context.Context, db *sql.DB, table string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT COLUMN_NAME
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND COLUMN_NAME != 'id'
+		ORDER BY ORDINAL_POSITION
+	`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		cols = append(cols, c)
+	}
+	return cols, rows.Err()
 }
 
 // loadConflictRowIDs returns the list of base_id values currently in
