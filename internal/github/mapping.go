@@ -188,11 +188,22 @@ func BeadsIssueToGitHubFields(issue *types.Issue, config *MappingConfig) map[str
 
 	fields["labels"] = labels
 
-	// Set state for closed issues
+	// State handling: only ever push a *close*, never an *open*.
+	//
+	// BeadsIssueToGitHubFields is sent on every content/label sync, and
+	// autosync fires it after each bd write. Previously this set
+	// state:"open" for any non-closed bead, which REOPENED GitHub issues
+	// that had been closed (e.g. by a PR's "Closes #N") while their bead was
+	// still open/in_progress — the next bd update on that bead resurrected
+	// the issue ("zombie" issues, observed reopening as the token account).
+	//
+	// Closing stays authoritative (bead closed -> issue closed). Reopening a
+	// GitHub issue is intentionally NOT propagated from an open bead; do it
+	// deliberately on GitHub if a reopen is really wanted. Omitting the
+	// "state" key leaves the GitHub issue's state untouched on update, and
+	// CreateIssue ignores state anyway (new issues default to open).
 	if issue.Status == types.StatusClosed {
 		fields["state"] = "closed"
-	} else {
-		fields["state"] = "open"
 	}
 
 	return fields
