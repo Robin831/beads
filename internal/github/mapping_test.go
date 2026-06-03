@@ -376,9 +376,31 @@ func TestBeadsIssueToGitHubFields(t *testing.T) {
 		t.Errorf("labels missing status::in_progress, got %v", labels)
 	}
 
-	// Verify state is "open" for in-progress
-	if fields["state"] != "open" {
-		t.Errorf("fields[\"state\"] = %v, want \"open\"", fields["state"])
+	// Verify state is NOT pushed for a non-closed bead. Pushing state:"open"
+	// here would reopen GitHub issues closed out-of-band (e.g. by a PR's
+	// "Closes #N") on the next content/label autosync — the "zombie" bug.
+	if _, ok := fields["state"]; ok {
+		t.Errorf("fields[\"state\"] = %v, want no state key for in-progress (never reopen)", fields["state"])
+	}
+}
+
+// TestBeadsIssueToGitHubFields_OpenDoesNotReopen verifies that a non-closed
+// bead produces no "state" field, so a routine sync cannot reopen a closed
+// GitHub issue.
+func TestBeadsIssueToGitHubFields_OpenDoesNotReopen(t *testing.T) {
+	config := DefaultMappingConfig()
+
+	for _, status := range []types.Status{types.StatusOpen, types.StatusInProgress, types.StatusBlocked} {
+		fields := BeadsIssueToGitHubFields(&types.Issue{Title: "x", Status: status}, config)
+		if _, ok := fields["state"]; ok {
+			t.Errorf("status %q: fields[\"state\"] = %v, want absent (must not reopen)", status, fields["state"])
+		}
+	}
+
+	// A closed bead must still push state:"closed".
+	closed := BeadsIssueToGitHubFields(&types.Issue{Title: "x", Status: types.StatusClosed}, config)
+	if closed["state"] != "closed" {
+		t.Errorf("closed bead: fields[\"state\"] = %v, want \"closed\"", closed["state"])
 	}
 }
 
