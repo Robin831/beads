@@ -169,13 +169,40 @@ func runSafeResolve(ctx context.Context, db *sql.DB, table, strategy string, all
 		// status or the open↔in_progress claim race, identical content, only
 		// timestamps/status differ), and its pick rule — later updated_at
 		// wins, ties to ours — is exactly the WHERE below.
-		theirsWins := 0
+		oursWins, theirsWins := 0, 0
 		for _, pick := range picks {
 			if pick == pickTheirs {
 				theirsWins++
+			} else {
+				oursWins++
 			}
 		}
-		if theirsWins > 0 {
+		switch {
+		case theirsWins == 0:
+			// Every row keeps ours — straight whole-table resolve. Works
+			// under @autocommit (no write to the conflicted table needed).
+			if _, err := db.ExecContext(ctx,
+				fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE('--ours', %q)", table),
+			); err != nil {
+				return fmt.Errorf("auto-resolving %s (whole-table --ours): %w", table, err)
+			}
+		case oursWins == 0:
+			// Every row takes theirs (the dominant claim-race case: the
+			// active claim is the newer side). Straight whole-table resolve.
+			if _, err := db.ExecContext(ctx,
+				fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE('--theirs', %q)", table),
+			); err != nil {
+				return fmt.Errorf("auto-resolving %s (whole-table --theirs): %w", table, err)
+			}
+		default:
+			// Mixed picks: pre-patch the theirs-winning rows to theirs'
+			// values, then resolve the whole table with --ours. The UPDATE
+			// modifies a conflicted table, which @autocommit refuses ("merge
+			// conflict detected, transaction rolled back"), so allow
+			// conflict-tolerant commits on this connection first.
+			if _, err := db.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+				return fmt.Errorf("enabling conflict-tolerant commit for %s: %w", table, err)
+			}
 			cols, err := tableNonPKColumns(ctx, db, table)
 			if err != nil {
 				return fmt.Errorf("looking up %s columns: %w", table, err)
@@ -195,11 +222,11 @@ func runSafeResolve(ctx context.Context, db *sql.DB, table, strategy string, all
 			if _, err := db.ExecContext(ctx, upd); err != nil {
 				return fmt.Errorf("applying theirs to %s working tree: %w", table, err)
 			}
-		}
-		if _, err := db.ExecContext(ctx,
-			fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE('--ours', %q)", table),
-		); err != nil {
-			return fmt.Errorf("auto-resolving %s (whole-table --ours after pre-patch): %w", table, err)
+			if _, err := db.ExecContext(ctx,
+				fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE('--ours', %q)", table),
+			); err != nil {
+				return fmt.Errorf("auto-resolving %s (whole-table --ours after pre-patch): %w", table, err)
+			}
 		}
 		fmt.Fprintf(os.Stderr, "auto-resolved %d safe-shape conflict(s) on %s\n", len(picks), table)
 	} else {
