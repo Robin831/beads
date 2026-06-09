@@ -160,17 +160,46 @@ func runSafeResolve(ctx context.Context, db *sql.DB, table, strategy string, all
 				len(unsafe), table, len(preview), strings.Join(preview, ", "), table,
 			)
 		}
-		for id, pick := range picks {
-			pickStrategy := "--ours"
+		// Resolve whole-table rather than per-PK. The 3-arg per-row form
+		// CALL DOLT_CONFLICTS_RESOLVE(strategy, table, pk) is not supported by
+		// all dolt versions (fails with "table not found"), so instead we
+		// pre-patch the working-tree rows where theirs is the newer side to
+		// theirs' values, then resolve the whole table with --ours. classify
+		// has already guaranteed every conflicting row is safe-shape (same
+		// status or the open↔in_progress claim race, identical content, only
+		// timestamps/status differ), and its pick rule — later updated_at
+		// wins, ties to ours — is exactly the WHERE below.
+		theirsWins := 0
+		for _, pick := range picks {
 			if pick == pickTheirs {
-				pickStrategy = "--theirs"
+				theirsWins++
 			}
-			if _, err := db.ExecContext(ctx,
-				fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE(%q, %q, ?)", pickStrategy, table),
-				id,
-			); err != nil {
-				return fmt.Errorf("auto-resolving %s row %q with %s: %w", table, id, pickStrategy, err)
+		}
+		if theirsWins > 0 {
+			cols, err := tableNonPKColumns(ctx, db, table)
+			if err != nil {
+				return fmt.Errorf("looking up %s columns: %w", table, err)
 			}
+			if len(cols) == 0 {
+				return fmt.Errorf("no non-PK columns found for %s — schema lookup empty", table)
+			}
+			setClauses := make([]string, 0, len(cols))
+			for _, col := range cols {
+				setClauses = append(setClauses, fmt.Sprintf("t.`%s` = c.`their_%s`", col, col))
+			}
+			upd := fmt.Sprintf(
+				"UPDATE `%s` t JOIN dolt_conflicts_%s c ON t.id = COALESCE(c.our_id, c.their_id) "+
+					"SET %s WHERE c.their_updated_at > c.our_updated_at",
+				table, table, strings.Join(setClauses, ", "),
+			)
+			if _, err := db.ExecContext(ctx, upd); err != nil {
+				return fmt.Errorf("applying theirs to %s working tree: %w", table, err)
+			}
+		}
+		if _, err := db.ExecContext(ctx,
+			fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE('--ours', %q)", table),
+		); err != nil {
+			return fmt.Errorf("auto-resolving %s (whole-table --ours after pre-patch): %w", table, err)
 		}
 		fmt.Fprintf(os.Stderr, "auto-resolved %d safe-shape conflict(s) on %s\n", len(picks), table)
 	} else {
@@ -351,6 +380,34 @@ func firstNStrings(ss []string, n int) []string {
 	return ss[:n]
 }
 
+// tableNonPKColumns returns every column of <table> except the `id` primary
+// key, in ordinal order. Used by the --auto whole-table pre-patch to copy
+// theirs' values onto the working tree for rows where theirs is the newer
+// side, before resolving the whole table with --ours.
+func tableNonPKColumns(ctx context.Context, db *sql.DB, table string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT COLUMN_NAME
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND COLUMN_NAME != 'id'
+		ORDER BY ORDINAL_POSITION
+	`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		cols = append(cols, c)
+	}
+	return cols, rows.Err()
+}
+
 // pickSide enumerates which merge-parent's values the auto-resolver picks
 // for a single conflicting row.
 type pickSide int
@@ -359,6 +416,20 @@ const (
 	pickOurs pickSide = iota
 	pickTheirs
 )
+
+// isClaimRace reports whether a status-only conflict is the benign
+// worker-claim race: the bead was `open` at the merge base and the two
+// sides hold {open, in_progress} — one clone claimed it (set in_progress)
+// while the other still saw it open. With no other content drift (checked
+// separately by the caller), resolving by later updated_at takes the active
+// claim. This is the dominant recurring conflict on the multi-clone Forge
+// setup: a nightly job touches a bead on one clone ~50s before a worker
+// claims it on another, and the laptop loses the push race. Always safe to
+// auto-resolve — no field other than status/updated_at differs.
+func isClaimRace(base, a, b string) bool {
+	return base == "open" &&
+		((a == "open" && b == "in_progress") || (a == "in_progress" && b == "open"))
+}
 
 // safeShapeContentColumns are the columns that, when they differ between
 // ours and theirs, force the auto-resolver to bail out. Differences here
@@ -393,7 +464,7 @@ func classifyConflicts(ctx context.Context, db *sql.DB, table string) (map[strin
 	}
 
 	selectCols := []string{
-		"base_id", "our_status", "their_status",
+		"base_id", "base_status", "our_status", "their_status",
 		"our_updated_at", "their_updated_at",
 	}
 	for _, c := range safeShapeContentColumns {
@@ -425,20 +496,26 @@ func classifyConflicts(ctx context.Context, db *sql.DB, table string) (map[strin
 		}
 
 		id := nulls[0].String
-		ourStatus := nulls[1].String
-		theirStatus := nulls[2].String
-		ourUpdatedAt := nulls[3].String
-		theirUpdatedAt := nulls[4].String
+		baseStatus := nulls[1].String
+		ourStatus := nulls[2].String
+		theirStatus := nulls[3].String
+		ourUpdatedAt := nulls[4].String
+		theirUpdatedAt := nulls[5].String
 
-		if ourStatus != theirStatus {
+		// A status mismatch is normally unsafe — EXCEPT the benign
+		// worker-claim race (base open, sides {open, in_progress}), which is
+		// the dominant recurring conflict on the multi-clone Forge setup. For
+		// that shape we fall through to the content-drift check and the
+		// later-updated_at pick, which takes the active claim.
+		if ourStatus != theirStatus && !isClaimRace(baseStatus, ourStatus, theirStatus) {
 			unsafe = append(unsafe, id)
 			continue
 		}
 
 		contentDrift := false
 		for i, c := range safeShapeContentColumns {
-			ourVal := nulls[5+2*i]
-			theirVal := nulls[5+2*i+1]
+			ourVal := nulls[6+2*i]
+			theirVal := nulls[6+2*i+1]
 			if ourVal.Valid != theirVal.Valid || ourVal.String != theirVal.String {
 				_ = c // (named in selectCols above; loop index is enough here)
 				contentDrift = true
@@ -490,7 +567,7 @@ func loadConflictRowIDs(ctx context.Context, db *sql.DB, table string) ([]string
 func init() {
 	doltResolveCmd.Flags().Bool("ours", false, "Keep our (target branch) values for conflicting rows")
 	doltResolveCmd.Flags().Bool("theirs", false, "Take their (source branch) values for conflicting rows")
-	doltResolveCmd.Flags().Bool("auto", false, "Auto-resolve per-row: same-final-status + only timestamps differ → take later updated_at; anything else → bail")
+	doltResolveCmd.Flags().Bool("auto", false, "Auto-resolve per-row: same final status (or the open↔in_progress claim race) with no content drift → take later updated_at; anything else → bail")
 	doltResolveCmd.Flags().Bool("allow-row-loss", false, "Allow the commit even when rows on the merge parents will be dropped (override the safety guard)")
 	doltResolveCmd.Flags().StringP("message", "m", "", "Commit message (default: auto-generated)")
 	doltCmd.AddCommand(doltResolveCmd)
