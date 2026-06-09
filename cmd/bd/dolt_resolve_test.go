@@ -39,3 +39,33 @@ func TestDriverTruthy(t *testing.T) {
 		})
 	}
 }
+
+// TestIsClaimRace pins the one cross-status shape --auto is allowed to
+// resolve: base `open`, sides {open, in_progress}. Anything else with a
+// status mismatch must stay unsafe so a human looks at it. This is the
+// dominant recurring multi-clone conflict (a nightly job touches a bead on
+// one clone ~50s before a worker claims it on another).
+func TestIsClaimRace(t *testing.T) {
+	cases := []struct {
+		name             string
+		base, our, their string
+		want             bool
+	}{
+		{"ours open, theirs claimed", "open", "open", "in_progress", true},
+		{"ours claimed, theirs open", "open", "in_progress", "open", true},
+		{"base not open (unclaim race)", "in_progress", "in_progress", "open", false},
+		{"base closed", "closed", "open", "in_progress", false},
+		{"both open (not a mismatch)", "open", "open", "open", false},
+		{"open vs closed", "open", "open", "closed", false},
+		{"in_progress vs closed", "open", "in_progress", "closed", false},
+		{"open vs blocked", "open", "open", "blocked", false},
+		{"empty strings", "", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isClaimRace(tc.base, tc.our, tc.their); got != tc.want {
+				t.Fatalf("isClaimRace(%q,%q,%q) = %v, want %v", tc.base, tc.our, tc.their, got, tc.want)
+			}
+		})
+	}
+}
