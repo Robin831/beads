@@ -389,6 +389,20 @@ const (
 	pickTheirs
 )
 
+// isClaimRace reports whether a status-only conflict is the benign
+// worker-claim race: the bead was `open` at the merge base and the two
+// sides hold {open, in_progress} — one clone claimed it (set in_progress)
+// while the other still saw it open. With no other content drift (checked
+// separately by the caller), resolving by later updated_at takes the active
+// claim. This is the dominant recurring conflict on the multi-clone Forge
+// setup: a nightly job touches a bead on one clone ~50s before a worker
+// claims it on another, and the laptop loses the push race. Always safe to
+// auto-resolve — no field other than status/updated_at differs.
+func isClaimRace(base, a, b string) bool {
+	return base == "open" &&
+		((a == "open" && b == "in_progress") || (a == "in_progress" && b == "open"))
+}
+
 // safeShapeContentColumns are the columns that, when they differ between
 // ours and theirs, force the auto-resolver to bail out. Differences here
 // represent real content drift that needs a human decision. Timestamps
@@ -422,7 +436,7 @@ func classifyConflicts(ctx context.Context, db *sql.DB, table string) (map[strin
 	}
 
 	selectCols := []string{
-		"base_id", "our_status", "their_status",
+		"base_id", "base_status", "our_status", "their_status",
 		"our_updated_at", "their_updated_at",
 	}
 	for _, c := range safeShapeContentColumns {
@@ -454,20 +468,26 @@ func classifyConflicts(ctx context.Context, db *sql.DB, table string) (map[strin
 		}
 
 		id := nulls[0].String
-		ourStatus := nulls[1].String
-		theirStatus := nulls[2].String
-		ourUpdatedAt := nulls[3].String
-		theirUpdatedAt := nulls[4].String
+		baseStatus := nulls[1].String
+		ourStatus := nulls[2].String
+		theirStatus := nulls[3].String
+		ourUpdatedAt := nulls[4].String
+		theirUpdatedAt := nulls[5].String
 
-		if ourStatus != theirStatus {
+		// A status mismatch is normally unsafe — EXCEPT the benign
+		// worker-claim race (base open, sides {open, in_progress}), which is
+		// the dominant recurring conflict on the multi-clone Forge setup. For
+		// that shape we fall through to the content-drift check and the
+		// later-updated_at pick, which takes the active claim.
+		if ourStatus != theirStatus && !isClaimRace(baseStatus, ourStatus, theirStatus) {
 			unsafe = append(unsafe, id)
 			continue
 		}
 
 		contentDrift := false
 		for i, c := range safeShapeContentColumns {
-			ourVal := nulls[5+2*i]
-			theirVal := nulls[5+2*i+1]
+			ourVal := nulls[6+2*i]
+			theirVal := nulls[6+2*i+1]
 			if ourVal.Valid != theirVal.Valid || ourVal.String != theirVal.String {
 				_ = c // (named in selectCols above; loop index is enough here)
 				contentDrift = true
@@ -546,7 +566,7 @@ func loadConflictRowIDs(ctx context.Context, db *sql.DB, table string) ([]string
 func init() {
 	doltResolveCmd.Flags().Bool("ours", false, "Keep our (target branch) values for conflicting rows")
 	doltResolveCmd.Flags().Bool("theirs", false, "Take their (source branch) values for conflicting rows")
-	doltResolveCmd.Flags().Bool("auto", false, "Auto-resolve per-row: same-final-status + only timestamps differ → take later updated_at; anything else → bail")
+	doltResolveCmd.Flags().Bool("auto", false, "Auto-resolve per-row: same final status (or the open↔in_progress claim race) with no content drift → take later updated_at; anything else → bail")
 	doltResolveCmd.Flags().Bool("allow-row-loss", false, "Allow the commit even when rows on the merge parents will be dropped (override the safety guard)")
 	doltResolveCmd.Flags().StringP("message", "m", "", "Commit message (default: auto-generated)")
 	doltCmd.AddCommand(doltResolveCmd)
