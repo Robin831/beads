@@ -87,6 +87,45 @@ func resolveEmbeddedDoltDir() string {
 	return dir
 }
 
+// remoteCLIOutputIndicatesSuccess decides whether a `dolt push`/`dolt pull`
+// that exited non-zero actually succeeded. Dolt sometimes exits non-zero on
+// cosmetic conditions (spinner cleanup, "nothing to push") even when the
+// operation succeeded, so we match only narrow, content-bearing markers.
+//
+// Two false-positive traps are deliberately avoided:
+//   - A generic "->" ref-update substring fires during the FETCH phase of a
+//     `dolt pull` whose subsequent MERGE failed (e.g. because bd's parent
+//     process is holding the embedded Dolt write lock), so it is never matched.
+//   - A *conflicted* `dolt pull` still prints "Updating <a>..<b>" (and
+//     "Auto-merging") during its merge phase before the conflict, so the
+//     "Updating " marker alone would mis-classify a failed merge as success.
+//     When that happens the caller (the dolt-puller sidecar) logs "pull ok"
+//     and skips its `bd dolt resolve --auto` recovery, leaving the embedded
+//     clone stuck mid-merge: every iteration aborts and re-pulls the same
+//     conflict forever, and the daemon's writes hit "Error 1105: Merge
+//     conflict detected". So a conflict outcome is treated as a hard failure
+//     — the error (which contains "conflict") then propagates and recovery can
+//     run.
+//
+// False-positive successes here cause auto-pull/auto-push to silently skip
+// work for the entire debounce window — see dolt_autopull.go and
+// dolt_autopush.go.
+func remoteCLIOutputIndicatesSuccess(op, outStr string) bool {
+	conflicted := op == "pull" && (strings.Contains(outStr, "CONFLICT") ||
+		strings.Contains(outStr, "Automatic merge failed") ||
+		strings.Contains(outStr, "Merge conflict"))
+	if conflicted {
+		return false
+	}
+	return strings.Contains(outStr, "Everything up-to-date") ||
+		strings.Contains(outStr, "Already up to date") ||
+		(strings.Contains(outStr, "branch '") && strings.Contains(outStr, "set up to track")) ||
+		(op == "push" && strings.Contains(outStr, "[new branch]")) ||
+		(op == "pull" && (strings.Contains(outStr, "Fast-forward") ||
+			strings.Contains(outStr, "Merge made by") ||
+			strings.Contains(outStr, "Updating ")))
+}
+
 // tryRemoteCLIPushPull runs `dolt <op> <remote> <branch>` from the embedded
 // dolt directory, passing --user=$DOLT_REMOTE_USER so DOLT_REMOTE_PASSWORD
 // authenticates against a remotesapi that requires username/password. The
@@ -145,24 +184,11 @@ func tryRemoteCLIPushPull(ctx context.Context, op, remote, branch string) error 
 	// Inherit env so DOLT_REMOTE_PASSWORD propagates.
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// Dolt push/pull sometimes exits non-zero on cosmetic conditions
-		// (spinner cleanup, "nothing to push") even when the operation
-		// succeeded. Match only narrow, content-bearing markers — never a
-		// generic "->" ref-update substring, because that fires during the
-		// FETCH phase of a `dolt pull` whose subsequent MERGE failed (e.g.
-		// because bd's parent process is holding the embedded Dolt write
-		// lock). False-positive successes here cause auto-pull/auto-push to
-		// silently skip work for the entire debounce window — see
-		// dolt_autopull.go and dolt_autopush.go.
+		// dolt exited non-zero — but it does that on cosmetic conditions too,
+		// so consult the output before treating it as a real failure (see
+		// remoteCLIOutputIndicatesSuccess for the marker rationale).
 		outStr := string(out)
-		successful := strings.Contains(outStr, "Everything up-to-date") ||
-			strings.Contains(outStr, "Already up to date") ||
-			(strings.Contains(outStr, "branch '") && strings.Contains(outStr, "set up to track")) ||
-			(op == "push" && strings.Contains(outStr, "[new branch]")) ||
-			(op == "pull" && (strings.Contains(outStr, "Fast-forward") ||
-				strings.Contains(outStr, "Merge made by") ||
-				strings.Contains(outStr, "Updating ")))
-		if successful {
+		if remoteCLIOutputIndicatesSuccess(op, outStr) {
 			debug.Logf("dolt %s via CLI: dolt exited %v but output indicates success\n", op, err)
 			return nil
 		}
