@@ -212,6 +212,14 @@ type Config struct {
 	CommitterEmail string // Git-style committer email
 	Remote         string // Default remote name (e.g., "origin")
 	Database       string // Database name within Dolt (default: "beads")
+	// Branch optionally pins server-mode connections to a specific Dolt branch
+	// via a revision-qualified database (`<Database>/<Branch>`). When empty,
+	// connections use the server's default checked-out branch. Populated from
+	// the configured sync-branch in server mode so shared-server clients (e.g.
+	// the in-cluster devbox) read/write the team's working branch instead of a
+	// stale default branch. Embedded mode ignores this — it selects the branch
+	// at engine-open time.
+	Branch         string
 	ReadOnly       bool   // Open in read-only mode (skip schema init)
 
 	// Server connection options
@@ -1333,7 +1341,17 @@ func applyPoolLimits(db *sql.DB, cfg *Config) {
 
 // openServerConnection opens a connection to a dolt sql-server via MySQL protocol
 func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, error) {
-	connStr := buildServerDSN(cfg, cfg.Database)
+	// When a branch is pinned (server mode + configured sync-branch), connect
+	// the pool to the revision-qualified database (`db/branch`) so every pooled
+	// connection operates on that branch. The existence/CREATE/validation checks
+	// below deliberately use the BASE name (cfg.Database): `SHOW DATABASES` lists
+	// `db`, never `db/branch`, and CREATE DATABASE must target the base — passing
+	// the revision spec there is what made branch-qualified connects fail before.
+	connDatabase := cfg.Database
+	if cfg.Branch != "" {
+		connDatabase = cfg.Database + "/" + cfg.Branch
+	}
+	connStr := buildServerDSN(cfg, connDatabase)
 
 	db, err := sql.Open("mysql", connStr)
 	if err != nil {
