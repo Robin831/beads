@@ -1341,6 +1341,23 @@ func applyPoolLimits(db *sql.DB, cfg *Config) {
 
 // openServerConnection opens a connection to a dolt sql-server via MySQL protocol
 func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, error) {
+	// Resolve the branch to pin: an explicit cfg.Branch, else the configured
+	// sync-branch from the .beads config. Done HERE (not in applyResolvedConfig)
+	// because the CLI's PersistentPreRun opens the store via dolt.New(cfg)
+	// directly, bypassing applyResolvedConfig — openServerConnection is the one
+	// chokepoint every server-mode path funnels through. beadsDir falls back to
+	// the parent of cfg.Path (which is .beads/dolt) when cfg.BeadsDir is unset.
+	branch := cfg.Branch
+	if branch == "" {
+		beadsDir := cfg.BeadsDir
+		if beadsDir == "" && cfg.Path != "" {
+			beadsDir = filepath.Dir(cfg.Path)
+		}
+		if beadsDir != "" {
+			branch = resolveSyncBranch(beadsDir)
+		}
+	}
+
 	// When a branch is pinned (server mode + configured sync-branch), connect
 	// the pool to the revision-qualified database (`db/branch`) so every pooled
 	// connection operates on that branch. The existence/CREATE/validation checks
@@ -1348,8 +1365,8 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, er
 	// `db`, never `db/branch`, and CREATE DATABASE must target the base — passing
 	// the revision spec there is what made branch-qualified connects fail before.
 	connDatabase := cfg.Database
-	if cfg.Branch != "" {
-		connDatabase = cfg.Database + "/" + cfg.Branch
+	if branch != "" {
+		connDatabase = cfg.Database + "/" + branch
 	}
 	connStr := buildServerDSN(cfg, connDatabase)
 

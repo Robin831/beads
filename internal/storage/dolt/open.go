@@ -231,18 +231,6 @@ func applyResolvedConfig(beadsDir string, fileCfg *configfile.Config, cfg *Confi
 		cfg.ServerTLS = fileCfg.GetDoltServerTLS()
 	}
 
-	// In server mode, pin the connection to the configured sync-branch so a
-	// shared-server client reads/writes the team's working branch rather than
-	// the server's default checked-out branch — which can lag badly (a
-	// dolt-beads server keeps `main` checked out while all work lives on
-	// `beads-sync`, so server-mode clients otherwise see a stale snapshot).
-	// Only applies when a sync-branch is configured AND no explicit branch was
-	// already requested; repos without one keep the previous default-branch
-	// behavior, and embedded mode never reaches here.
-	if cfg.Branch == "" && fileCfg.IsDoltServerMode() {
-		cfg.Branch = resolveSyncBranch(beadsDir)
-	}
-
 	// Pool size: env var > config.yaml > caller override > default (10).
 	// Useful for shared-server setups with many worktrees (GH#3140).
 	if cfg.MaxOpenConns == 0 {
