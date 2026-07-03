@@ -1116,19 +1116,27 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		autoStartedServerDir: autoStartedDir,
 	}
 
-	// Schema initialization for server mode (idempotent).
+	// Ensure dolt_ignore'd tables exist on EVERY open, INCLUDING read-only.
+	// These tables (wisps, wisp_*, local_metadata, repo_mtimes) live in the
+	// working set and are DROPPED when the shared Dolt server restarts. A
+	// read-only command (bd show / bd ready, which skip schema init) that
+	// doesn't recreate them then hard-fails with "table not found: wisps" even
+	// though writes still land — which reads like data loss and misleads agents
+	// into believing a just-filed bead vanished. EnsureIgnoredTables is cheap
+	// (SHOW TABLES; CREATE TABLE IF NOT EXISTS only when missing) and idempotent,
+	// so running it on reads is safe and self-heals the working set.
+	//
+	// It must also run BEFORE migrations, which may reference these tables
+	// (e.g. 0027 alters wisps, 0030 inserts into local_metadata).
+	if err := versioncontrolops.EnsureIgnoredTables(ctx, db); err != nil {
+		return nil, fmt.Errorf("failed to ensure ignored tables: %w", err)
+	}
+
+	// Schema initialization (migrations) — write opens only; reads skip it.
 	// Short retry for Dolt "no root value found in session" race: after
 	// CREATE DATABASE, information_schema queries may fail transiently
 	// even though Ping succeeded. This resolves within ~1s.
 	if !cfg.ReadOnly {
-		// Ensure dolt_ignore'd tables exist BEFORE running migrations.
-		// Migrations may reference these tables (e.g. 0027 alters wisps,
-		// 0030 inserts into local_metadata). After a clone or server restart
-		// these tables don't exist yet since they're not in committed data.
-		if err := versioncontrolops.EnsureIgnoredTables(ctx, db); err != nil {
-			return nil, fmt.Errorf("failed to ensure ignored tables: %w", err)
-		}
-
 		schemaBO := backoff.NewExponentialBackOff()
 		schemaBO.InitialInterval = 100 * time.Millisecond
 		schemaBO.MaxElapsedTime = 5 * time.Second
