@@ -270,6 +270,10 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	// mocked world has no local_metadata table, so no crashed pass.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// ...then the #4380 drift record, which exempts drift-skipped tables from
+	// the dirty guard. Same missing-table answer.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	// MigrateUp captures the pre-pass main cursor for the aux re-key
 	// watershed (bd-578h9.4) before the main migrations run.
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
@@ -321,6 +325,13 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	// marker is pending; at latest it is not, so the re-key no-ops.
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", latestIgnored)
 	expectIgnoredSentinelProbes(mock, true)
+	// #4380: the marker alone no longer proves convergence (a drift skip records
+	// it while still owing work), so each pass reads the rekey state before
+	// concluding it has nothing to do — once per pass in auxRekeyPasses, off the
+	// single shared cursor read above.
+	for _, p := range auxRekeyPasses {
+		expectAuxRekeyStateFor(mock, p.sentinelKey, false)
+	}
 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS ignored_schema_migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectContentHashColumnExists(mock)
@@ -401,7 +412,10 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 	// Nothing staged -> no unstage exec; seed was a no-op -> no seed commit.
 	// committableDirtyTables re-reads dolt_status (ignored tables excluded).
 	expectDoltStatusDirtyEvents(mock)
-	// auxRekeyResumePending: no local_metadata table, no crashed rekey pass.
+	// anyAuxRekeyResumePending: no local_metadata table, no crashed rekey pass.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// readAuxRekeyDrifted (#4380): same probe, same missing-table answer.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	// pendingMigrationDirtyTables: cursor read, then pending 0062's SQL

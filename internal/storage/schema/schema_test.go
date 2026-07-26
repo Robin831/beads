@@ -82,7 +82,12 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	// committableDirtyTables -> dirtyTables(ctx, db, true): same dirty state.
 	expectDirtyDoltStatusRow(mock, "dependencies", false)
 
-	// auxRekeyResumePending: no local_metadata table, so no resume in flight.
+	// anyAuxRekeyResumePending: no local_metadata table, so no resume in flight.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// readAuxRekeyDrifted (#4380): the drift record exempts skipped tables from
+	// the dirty guard below, so it is read here too. Same missing-table answer.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 

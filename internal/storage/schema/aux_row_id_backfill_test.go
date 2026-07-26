@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -202,7 +203,11 @@ func TestRekeyAuxRowIDsSkipsWhenMarkerRecorded(t *testing.T) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion)
 	expectIgnoredSentinelProbes(mock, true)
-	// No further expectations: no table may be probed or scanned.
+	// The rekey state is read even with the marker recorded (#4380): a pass that
+	// skipped a drifted table records the marker while still owing work, so the
+	// marker alone can no longer prove convergence. Nothing is owed here, so no
+	// table is probed or scanned beyond this read.
+	expectAuxRekeyState(mock, false)
 
 	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial)
 	if err != nil {
@@ -249,18 +254,13 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
 	}
 }
 
-// expectAuxRekeySentinel mocks auxRekeyResumePending: the local_metadata
-// table-existence probe, then (when the table exists) the sentinel-row count.
+// expectAuxRekeySentinel mocks the resume read. The fork replaced upstream's
+// single-key auxRekeyResumePending with readAuxRekeyState (#4380), which reads
+// the pass sentinel and the drift record in ONE row query — so what used to be
+// a COUNT is now a two-key IN. Kept under the original name so upstream's
+// callers need no edit; drift-aware tests call expectAuxRekeyState directly.
 func expectAuxRekeySentinel(mock sqlmock.Sqlmock, pending bool) {
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	n := 0
-	if pending {
-		n = 1
-	}
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
-		WithArgs(auxRekeyPassInitial.sentinelKey).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
+	expectAuxRekeyState(mock, pending)
 }
 
 func expectSetAuxRekeySentinel(mock sqlmock.Sqlmock) {
@@ -369,4 +369,44 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sql expectations: %v", err)
 	}
+}
+
+// expectAuxRekeyState mocks readAuxRekeyState for the INITIAL pass: the
+// local_metadata table-existence probe, then the one row-read returning both
+// that pass's in-flight sentinel and the (pass-independent) #4380 drift record.
+func expectAuxRekeyState(mock sqlmock.Sqlmock, resume bool, drifted ...string) {
+	expectAuxRekeyStateFor(mock, auxRowRekeyInProgressKey, resume, drifted...)
+}
+
+// expectAuxRekeyStateFor is the same for an arbitrary pass sentinel. Needed
+// because MigrateUp runs every pass in auxRekeyPasses and each reads its OWN
+// sentinel — the second pass looks for aux_row_rekey2_in_progress, not the
+// initial pass's key.
+func expectAuxRekeyStateFor(mock sqlmock.Sqlmock, sentinelKey string, resume bool, drifted ...string) {
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	rows := sqlmock.NewRows([]string{"key", "value"})
+	if resume {
+		rows.AddRow(sentinelKey, "1")
+	}
+	if len(drifted) > 0 {
+		rows.AddRow(auxRowRekeyDriftedKey, strings.Join(drifted, ","))
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT `key`, value FROM local_metadata WHERE `key` IN (?, ?)")).
+		WithArgs(sentinelKey, auxRowRekeyDriftedKey).
+		WillReturnRows(rows)
+}
+
+func expectSetAuxRekeyDrifted(mock sqlmock.Sqlmock, tables ...string) {
+	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS local_metadata`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)")).
+		WithArgs(auxRowRekeyDriftedKey, strings.Join(tables, ",")).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func expectClearAuxRekeyDrifted(mock sqlmock.Sqlmock) {
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
+		WithArgs(auxRowRekeyDriftedKey).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 }
