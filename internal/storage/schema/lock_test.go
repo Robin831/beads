@@ -147,6 +147,7 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	// table, so the read stops at the table-existence probe and the re-key
 	// no-ops.
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", latestIgnored)
+	expectIgnoredSentinelProbes(mock, true)
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO dolt_ignore VALUES ('ignored_schema_migrations', true)")).
@@ -155,6 +156,7 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectContentHashColumnExists(mock)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", latestIgnored)
+	expectIgnoredSentinelProbes(mock, true)
 	expectDoltStatusRows(mock)
 	expectDoltStatusRows(mock)
 	mock.ExpectQuery("(?s)SELECT t\\.TABLE_NAME\\s+FROM INFORMATION_SCHEMA\\.TABLES t").
@@ -189,4 +191,20 @@ func expectScalar(mock sqlmock.Sqlmock, query, column string, value any) {
 func expectDoltStatusRows(mock sqlmock.Sqlmock) {
 	mock.ExpectQuery("(?s)SELECT s\\.table_name, s\\.staged\\s+FROM dolt_status s").
 		WillReturnRows(sqlmock.NewRows([]string{"table_name", "staged"}))
+}
+
+// expectIgnoredSentinelProbes mocks the sentinel-table probes the guarded
+// currentVersion issues before believing a non-zero ignored cursor (gh 5033):
+// one INFORMATION_SCHEMA.TABLES lookup per sentinel table. present=false is the
+// contradicted-cursor case — the cursor claims applied while the tables are
+// absent — which is what makes the series re-run and heal the clone.
+func expectIgnoredSentinelProbes(mock sqlmock.Sqlmock, present bool) {
+	count := 0
+	if present {
+		count = 1
+	}
+	for range ignoredSource.sentinelTables {
+		mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(count))
+	}
 }

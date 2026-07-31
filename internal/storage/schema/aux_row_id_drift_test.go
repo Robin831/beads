@@ -94,6 +94,7 @@ func TestRekeyAuxRowIDsSkipsDriftedTable(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	// events carries the drift: its scan panics server-side.
@@ -134,6 +135,7 @@ func TestRekeyAuxRowIDsSkipsDriftDuringRewrite(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	expectColumnExists(mock, true)
@@ -177,6 +179,7 @@ func TestRekeyAuxRowIDsAbortsOnNonDriftError(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	expectColumnExists(mock, true)
@@ -211,6 +214,7 @@ func TestRekeyAuxRowIDsResumesDriftedTableOnly(t *testing.T) {
 	// Marker recorded, no crash sentinel — the post-skip steady state.
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false, "events")
 	expectSetAuxRekeySentinel(mock)
 	// Exactly one table probe: any second one is an unexpected call, which is
@@ -250,6 +254,7 @@ func TestRekeyAuxRowIDsResumeStaysScopedAfterCrash(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion)
+	expectIgnoredSentinelProbes(mock, true)
 	// Marker recorded AND sentinel set: a drift-resume that died partway.
 	expectAuxRekeyState(mock, true, "events")
 	expectSetAuxRekeySentinel(mock)
@@ -278,6 +283,7 @@ func TestRekeyAuxRowIDsKeepsDriftRecordWhileUnrepaired(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false, "events")
 	expectSetAuxRekeySentinel(mock)
 	expectColumnExists(mock, true)

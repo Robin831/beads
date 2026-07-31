@@ -111,6 +111,7 @@ func TestMigrationWorkNeededAddsContentHashColumnOnUpToDateDB(t *testing.T) {
 	// Both sources are already at their latest version...
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
+	expectIgnoredSentinelProbes(mock, true)
 	// ...but schema_migrations predates the content_hash column.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
@@ -140,6 +141,11 @@ func TestMigrationWorkNotNeededWhenContentHashColumnsPresent(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
+	// The guarded currentVersion now probes the ignored series' sentinel tables
+	// before believing a non-zero cursor (gh 5033).
+	expectIgnoredSentinelProbes(mock, true)
+	// v1.1.2 detects content_hash via INFORMATION_SCHEMA.COLUMNS; upstream later
+	// switched to SHOW COLUMNS. Keep this base's query shape.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).

@@ -203,6 +203,7 @@ func TestRekeyAuxRowIDsSkipsWhenMarkerRecorded(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	// No further expectations: no table may be probed or scanned.
 
@@ -229,6 +230,7 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	// Each of the four tables is probed; this mocked world has none of them,
@@ -312,6 +314,7 @@ func TestRekeyAuxRowIDsSkipsConvergedLineage(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	// No further expectations: marker is pending, but the pre-pass main
 	// cursor at the watershed and no crash sentinel means no table may be
@@ -344,6 +347,7 @@ func TestRekeyAuxRowIDsResumesAfterCrash(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, true)
 	expectSetAuxRekeySentinel(mock)
 	for range auxRekeyTables {
@@ -373,6 +377,7 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	// First table probe fails; no DELETE of the sentinel may follow.
