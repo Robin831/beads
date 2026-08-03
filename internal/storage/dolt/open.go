@@ -257,6 +257,24 @@ func applyResolvedConfig(beadsDir string, fileCfg *configfile.Config, cfg *Confi
 	}
 }
 
+// resolveSyncBranch returns the configured sync branch (e.g. "beads-sync"),
+// preferring the initialized global viper config (all CLI paths) and falling
+// back to a direct read of the project config.yaml for library consumers that
+// never call config.Initialize(). Both the dotted ("sync.branch") and hyphen
+// ("sync-branch") key spellings are tried since the config layer normalizes
+// between them. Returns "" when no sync branch is configured.
+func resolveSyncBranch(beadsDir string) string {
+	for _, key := range []string{"sync.branch", "sync-branch"} {
+		if b := config.GetString(key); b != "" {
+			return b
+		}
+		if b := config.GetStringFromDir(beadsDir, key); b != "" {
+			return b
+		}
+	}
+	return ""
+}
+
 // applyCentralConfigDefaults loads the central server config from
 // ~/.config/beads/server.json (or BEADS_CENTRAL_CONFIG env var) and
 // applies its server fields as defaults to the per-project config.
