@@ -54,7 +54,7 @@ Examples:
   bd dolt resolve --ours issues             # take ours
   bd dolt resolve --theirs issues --allow-row-loss   # accept row loss explicitly (rare; usually means a deliberate cleanup)`,
 	Args: cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		table := args[0]
 		ours, _ := cmd.Flags().GetBool("ours")
 		theirs, _ := cmd.Flags().GetBool("theirs")
@@ -73,7 +73,7 @@ Examples:
 			modeCount++
 		}
 		if modeCount != 1 {
-			FatalError("exactly one of --ours, --theirs, or --auto is required")
+			return HandleError("exactly one of --ours, --theirs, or --auto is required")
 		}
 		strategy := "--ours"
 		if theirs {
@@ -86,7 +86,7 @@ Examples:
 		ctx := context.Background()
 		st := getStore()
 		if st == nil {
-			FatalError("no store available")
+			return HandleError("no store available")
 		}
 		inner := storage.UnwrapStore(st)
 
@@ -102,19 +102,20 @@ Examples:
 			if err := backend.WithConflictDB(ctx, func(db *sql.DB) error {
 				return runSafeResolve(ctx, db, table, strategy, allowRowLoss, message)
 			}); err != nil {
-				FatalError("%v", err)
+				return HandleError("%v", err)
 			}
 		case interface{ DB() *sql.DB }:
 			sqlDB := backend.DB()
 			if sqlDB == nil {
-				FatalError("database handle is nil")
+				return HandleError("database handle is nil")
 			}
 			if err := runSafeResolve(ctx, sqlDB, table, strategy, allowRowLoss, message); err != nil {
-				FatalError("%v", err)
+				return HandleError("%v", err)
 			}
 		default:
-			FatalError("storage backend does not expose a database handle; run from an embedded-mode workspace or with dolt server connection configured")
+			return HandleError("storage backend does not expose a database handle; run from an embedded-mode workspace or with dolt server connection configured")
 		}
+		return nil
 	},
 }
 

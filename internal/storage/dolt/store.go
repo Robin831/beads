@@ -367,8 +367,16 @@ type Config struct {
 	CommitterEmail string // Git-style committer email
 	Remote         string // Default remote name (e.g., "origin")
 	Database       string // Database name within Dolt (default: "beads")
-	ReadOnly       bool   // Open in read-only mode (skip schema init)
-	Preview        bool   // Non-mutating preview: embedded opens skip schema init and refuse writes
+	// Branch optionally pins server-mode connections to a specific Dolt branch
+	// via a revision-qualified database (`<Database>/<Branch>`). When empty,
+	// openServerConnection falls back to the configured sync-branch; when that
+	// is also unset, connections use the server's default checked-out branch.
+	// Populated so shared-server clients (e.g. the in-cluster devbox) read/write
+	// the team's working branch instead of a stale default branch. Embedded mode
+	// ignores this — it selects the branch at engine-open time.
+	Branch   string
+	ReadOnly bool // Open in read-only mode (skip schema init)
+	Preview  bool // Non-mutating preview: embedded opens skip schema init and refuse writes
 
 	// LenientOpen opens the store leniently: embedded mode only. A migration
 	// gate refusal (#4259) or a dirty-working-set refusal (#4566) skips the
@@ -2290,7 +2298,34 @@ type serverConnFacts struct {
 // on a dolt sql-server via MySQL protocol. See serverConnFacts for what the
 // returned facts mean and why they are not a single bool.
 func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, serverConnFacts, error) {
-	connStr := buildServerDSN(cfg, cfg.Database)
+	// Resolve the branch to pin: an explicit cfg.Branch, else the configured
+	// sync-branch from the .beads config. Done HERE (not in applyResolvedConfig)
+	// because the CLI's PersistentPreRun opens the store via dolt.New(cfg)
+	// directly, bypassing applyResolvedConfig — openServerConnection is the one
+	// chokepoint every server-mode path funnels through. beadsDir falls back to
+	// the parent of cfg.Path (which is .beads/dolt) when cfg.BeadsDir is unset.
+	branch := cfg.Branch
+	if branch == "" {
+		beadsDir := cfg.BeadsDir
+		if beadsDir == "" && cfg.Path != "" {
+			beadsDir = filepath.Dir(cfg.Path)
+		}
+		if beadsDir != "" {
+			branch = resolveSyncBranch(beadsDir)
+		}
+	}
+
+	// When a branch is pinned (server mode + configured sync-branch), connect
+	// the pool to the revision-qualified database (`db/branch`) so every pooled
+	// connection operates on that branch. The existence/CREATE/validation checks
+	// below deliberately use the BASE name (cfg.Database): `SHOW DATABASES` lists
+	// `db`, never `db/branch`, and CREATE DATABASE must target the base — passing
+	// the revision spec there is what made branch-qualified connects fail before.
+	connDatabase := cfg.Database
+	if branch != "" {
+		connDatabase = cfg.Database + "/" + branch
+	}
+	connStr := buildServerDSN(cfg, connDatabase)
 
 	db, err := sql.Open("mysql", connStr)
 	if err != nil {
