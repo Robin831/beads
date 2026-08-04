@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/lockfile"
@@ -42,6 +44,45 @@ func usesProxiedServer() bool {
 		return proxiedServerMode
 	}
 	return cmdCtx != nil && cmdCtx.ProxiedServerMode
+}
+
+// embeddedBranch resolves the Dolt branch the embedded store targets. This was
+// hardcoded to "main", which is wrong for any team that works on a sync branch.
+//
+// The damage is in sync, not reads: reads follow the clone's checked-out branch,
+// but push/pull use this value. With "main" hardcoded, on a clone checked out to
+// beads-sync, auto-pull ran `merge origin/main` — trying to merge a branch nobody
+// works on INTO the working branch — and auto-push targeted origin/main. Observed
+// in-cluster on the v1.1.2 soak, and present in fork/main too, so this is
+// long-standing rather than new. It has been survivable only because the merge
+// fails on schema divergence instead of succeeding; once main and the sync branch
+// share a schema (which the v53 migration makes likely) it would start
+// succeeding, silently polluting the working branch.
+//
+// Falls back to "main" when no sync branch is configured, preserving the old
+// behaviour for repos that genuinely work on main.
+func embeddedBranch(cfg *dolt.Config) string {
+	if b := strings.TrimSpace(cfg.Branch); b != "" {
+		return b
+	}
+	return embeddedBranchFromDir(cfg.BeadsDir)
+}
+
+// embeddedBranchFromDir is embeddedBranch for the call paths that only have a
+// beads directory. Both key spellings are tried because the config layer
+// normalizes between them.
+func embeddedBranchFromDir(beadsDir string) string {
+	for _, key := range []string{"sync.branch", "sync-branch"} {
+		if b := strings.TrimSpace(config.GetString(key)); b != "" {
+			return b
+		}
+		if beadsDir != "" {
+			if b := strings.TrimSpace(config.GetStringFromDir(beadsDir, key)); b != "" {
+				return b
+			}
+		}
+	}
+	return "main"
 }
 
 // newDoltStore creates a storage backend from an explicit config.
@@ -93,21 +134,25 @@ func newDoltStore(ctx context.Context, cfg *dolt.Config) (s storage.DoltStorage,
 			// hydration of foreign projects (GH#3231, bd-6dnrw.32) — instead
 			// of OpenForReadOnlyCommand, which is "otherwise a normal
 			// writable store".
-			return embeddeddolt.OpenReadOnly(ctx, cfg.BeadsDir, cfg.Database, "main")
+			return embeddeddolt.OpenReadOnly(ctx, cfg.BeadsDir, cfg.Database, embeddedBranch(cfg))
 		}
 		// Ordinary classified-read commands (bd show, bd list, ...) must
 		// not be bricked by the #4259 remote-migrate gate (bd-578h9.5);
 		// server mode's ReadOnly opens already skip migration entirely.
-		return embeddeddolt.OpenForReadOnlyCommand(ctx, cfg.BeadsDir, cfg.Database, "main")
+		//
+		// embeddedBranch(cfg), not "main": a clone whose work lives on a
+		// configured sync-branch would otherwise read a stale main and look
+		// like catastrophic data loss.
+		return embeddeddolt.OpenForReadOnlyCommand(ctx, cfg.BeadsDir, cfg.Database, embeddedBranch(cfg))
 	}
 	if cfg.LenientOpen {
 		// Working-set-reconcile commands (bd dolt commit, bd vc commit) must
 		// not be bricked by a pending-migration dirty-table refusal: that
 		// refusal's documented recovery is exactly the commit these commands
 		// run, so failing the open here would deadlock (#4566).
-		return embeddeddolt.OpenForWorkingSetReconcile(ctx, cfg.BeadsDir, cfg.Database, "main")
+		return embeddeddolt.OpenForWorkingSetReconcile(ctx, cfg.BeadsDir, cfg.Database, embeddedBranch(cfg))
 	}
-	return embeddeddolt.Open(ctx, cfg.BeadsDir, cfg.Database, "main")
+	return embeddeddolt.Open(ctx, cfg.BeadsDir, cfg.Database, embeddedBranch(cfg))
 }
 
 // acquireEmbeddedLock acquires an exclusive flock on the embeddeddolt data
@@ -181,7 +226,7 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (s storage.Dol
 		}
 		database = sanitized
 	}
-	return embeddeddolt.Open(ctx, beadsDir, database, "main")
+	return embeddeddolt.Open(ctx, beadsDir, database, embeddedBranchFromDir(beadsDir))
 }
 
 // migrateHyphenatedDB renames a legacy hyphenated database directory and
@@ -294,5 +339,5 @@ func openNonMutatingStoreFromConfig(ctx context.Context, beadsDir string, previe
 	// run the remote-migrate gate (a behind, remote-backed database would fail
 	// hard) and must not write migrations into the target's history
 	// (bd-6dnrw.32, GH#3231).
-	return embeddeddolt.OpenReadOnly(ctx, beadsDir, database, "main")
+	return embeddeddolt.OpenReadOnly(ctx, beadsDir, database, embeddedBranchFromDir(beadsDir))
 }
