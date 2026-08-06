@@ -194,10 +194,18 @@ func Initialize() error {
 	// The overwritten side is preserved in Dolt history.
 	//
 	// Defaults to FALSE deliberately: this silently discards the losing edit on
-	// every auto-pull, so it stays inert until validated against a real conflict
-	// (the hermetic embedded-conflict test is still pending — see
-	// pull_autoresolve_test.go) and then explicitly enabled with
+	// every auto-pull, so it is opt-in per clone with
 	// `bd config set dolt.auto-resolve-conflicts true`.
+	//
+	// The validation this was waiting on now exists: pull_autoresolve_test.go
+	// builds a real embedded modify/modify conflict and asserts the resolver
+	// picks the later updated_at in BOTH directions (remote-newer and
+	// local-newer), so a fixed --ours/--theirs winner cannot pass. The default
+	// stays FALSE regardless — proving the resolver correct is not the same as
+	// deciding every clone should silently drop the losing edit, and that call
+	// belongs to whoever runs the clone. The embedded forge pod is the intended
+	// first opt-in: it is unattended, so a wedged anvil there blocks every write
+	// until a human intervenes.
 	v.SetDefault("dolt.auto-resolve-conflicts", false)
 
 	// Routing configuration defaults
