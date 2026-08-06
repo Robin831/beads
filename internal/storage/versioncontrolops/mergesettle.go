@@ -195,7 +195,7 @@ func workingSetClean(ctx context.Context, db DBConn) bool {
 
 // TryAutoResolveMergeConflicts auto-resolves merge conflicts that are safe to
 // resolve without operator input, and returns (true, nil) only if ALL conflicts
-// were resolved. It handles four classes:
+// were resolved. It handles five classes:
 //
 //   - metadata: machine-local rows (e.g. dolt_auto_push_*) that routinely diverge
 //     across clones (GH#2466). Resolved with "theirs".
@@ -221,6 +221,15 @@ func workingSetClean(ctx context.Context, db DBConn) bool {
 //     "theirs", so all clones pulling from one remote converge on the remote's
 //     value. A conflict touching ANY non-memory config key (issue_prefix above
 //     all) is a real semantic conflict and is left for the operator.
+//   - issues: per-row, the side with the later updated_at wins. This is the
+//     worker-claim race: one clone sets a bead in_progress while another edits
+//     the same row (often other fields entirely, carrying the base status
+//     along), so dolt's row-level detection flags a conflict that has an
+//     unambiguous answer — the later write. Ported back from the fork's
+//     server-mode DoltStore.tryAutoResolveConflicts, which carried this class
+//     before the v1.1.2 merge routed server mode through this shared helper and
+//     silently dropped it. Delete-vs-modify, a NULL updated_at on either side,
+//     or equal timestamps on differing rows are left for the operator.
 //
 // Any conflict on another table, or an unresolvable dependencies,
 // schema_migrations, or config conflict, returns (false, nil) so the caller
@@ -291,6 +300,19 @@ func TryAutoResolveMergeConflicts(ctx context.Context, db DBConn) (bool, error) 
 				return false, nil
 			}
 			resolvable = append(resolvable, "config")
+		case "issues":
+			// Decide resolvability BEFORE anything is resolved: the loop below
+			// mutates tables, and this function's contract is all-or-nothing.
+			// Discovering mid-resolution that a row needs a human would leave a
+			// partially-resolved working set staged but uncommitted.
+			timestamped, err := issuesConflictsAreTimestampResolvable(ctx, db)
+			if err != nil {
+				return false, err
+			}
+			if !timestamped {
+				return false, nil
+			}
+			resolvable = append(resolvable, "issues")
 		default:
 			return false, nil
 		}
@@ -320,6 +342,13 @@ func TryAutoResolveMergeConflicts(ctx context.Context, db DBConn) (bool, error) 
 			}
 			if _, err := db.ExecContext(ctx, "CALL DOLT_CONFLICTS_RESOLVE('--theirs', 'config')"); err != nil {
 				return false, fmt.Errorf("failed to resolve config conflicts: %w", err)
+			}
+		case "issues":
+			// Row-wise by updated_at: a table-level --ours/--theirs would drop one
+			// side's edit wholesale, which is exactly the loss this class exists
+			// to avoid.
+			if err := resolveIssuesConflictsByUpdatedAt(ctx, db); err != nil {
+				return false, err
 			}
 		default:
 			//nolint:gosec // G201: table is one of the hardcoded constants above.
@@ -551,6 +580,121 @@ func resolveSchemaMigrationsVintageConflicts(ctx context.Context, db DBConn) err
 		return fmt.Errorf("failed to resolve schema_migrations conflicts: %w", err)
 	}
 	return nil
+}
+
+// issuesConflictsAreTimestampResolvable reports whether every conflicting row
+// in the issues table can be settled by comparing updated_at. It only inspects;
+// resolveIssuesConflictsByUpdatedAt does the mutation. The split matters:
+// TryAutoResolveMergeConflicts must know every table is resolvable before it
+// resolves any of them, or a later "needs a human" verdict strands an
+// already-mutated working set.
+//
+// A row is NOT resolvable when either side deleted it (delete-vs-modify is a
+// semantic call), when either side has a NULL updated_at (nothing to compare),
+// or when the timestamps are equal yet the rows differ (breaking that tie on a
+// clock would be arbitrary).
+func issuesConflictsAreTimestampResolvable(ctx context.Context, db DBConn) (bool, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT our_updated_at, their_updated_at, our_diff_type, their_diff_type
+		FROM dolt_conflicts_issues
+	`)
+	if err != nil {
+		return false, fmt.Errorf("query issues conflicts: %w", err)
+	}
+	defer rows.Close()
+
+	any := false
+	for rows.Next() {
+		any = true
+		var (
+			ourUpdated, theirUpdated sql.NullTime
+			ourDiff, theirDiff       sql.NullString
+		)
+		if err := rows.Scan(&ourUpdated, &theirUpdated, &ourDiff, &theirDiff); err != nil {
+			return false, fmt.Errorf("scan issues conflict: %w", err)
+		}
+		if (ourDiff.Valid && ourDiff.String == "removed") || (theirDiff.Valid && theirDiff.String == "removed") {
+			return false, nil
+		}
+		if !ourUpdated.Valid || !theirUpdated.Valid {
+			return false, nil
+		}
+		if ourUpdated.Time.Equal(theirUpdated.Time) {
+			return false, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return any, nil
+}
+
+// resolveIssuesConflictsByUpdatedAt settles every conflicting issues row by
+// keeping the side whose updated_at is later. Callers must have confirmed
+// issuesConflictsAreTimestampResolvable first.
+//
+// Mechanism: for rows where theirs is newer, copy theirs' columns into our
+// working tree with an UPDATE, then accept what remains with
+// DOLT_CONFLICTS_RESOLVE('--ours'). The column list is discovered from
+// INFORMATION_SCHEMA so the resolver tracks future schema additions instead of
+// silently skipping columns added after it was written.
+func resolveIssuesConflictsByUpdatedAt(ctx context.Context, db DBConn) error {
+	cols, err := nonPKColumns(ctx, db, "issues", "id")
+	if err != nil {
+		return fmt.Errorf("look up issues columns: %w", err)
+	}
+	if len(cols) == 0 {
+		return fmt.Errorf("no non-PK columns found for issues — schema lookup empty")
+	}
+
+	setClauses := make([]string, 0, len(cols))
+	for _, col := range cols {
+		setClauses = append(setClauses, fmt.Sprintf("i.`%s` = c.`their_%s`", col, col))
+	}
+	// Only rows where theirs is strictly newer are overwritten; the rest keep
+	// our side, which --ours then accepts. Modify-vs-add (no base row) is fine:
+	// the join matches on PK regardless of whether a base exists.
+	//nolint:gosec // G201: column names come from INFORMATION_SCHEMA, not user input.
+	upd := fmt.Sprintf(`
+		UPDATE issues i
+		JOIN dolt_conflicts_issues c ON i.id = COALESCE(c.our_id, c.their_id)
+		SET %s
+		WHERE c.their_updated_at > c.our_updated_at
+	`, strings.Join(setClauses, ", "))
+	if _, err := db.ExecContext(ctx, upd); err != nil {
+		return fmt.Errorf("apply theirs to issues working tree: %w", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CONFLICTS_RESOLVE('--ours', 'issues')"); err != nil {
+		return fmt.Errorf("dolt_conflicts_resolve --ours issues: %w", err)
+	}
+	return nil
+}
+
+// nonPKColumns returns a table's non-primary-key column names in ordinal order,
+// used to build the dynamic UPDATE against dolt_conflicts_<table>.
+func nonPKColumns(ctx context.Context, db DBConn, table, pkColumn string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT COLUMN_NAME
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND COLUMN_NAME != ?
+		ORDER BY ORDINAL_POSITION
+	`, table, pkColumn)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		cols = append(cols, c)
+	}
+	return cols, rows.Err()
 }
 
 // resolveConflictDepTarget returns the single non-null dependency target from a
