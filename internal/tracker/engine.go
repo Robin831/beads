@@ -919,9 +919,17 @@ func (e *Engine) doCloseOnly(ctx context.Context, opts SyncOptions) (*PullStats,
 			continue
 		}
 
+		// Only the status is set here. `completed_at` is not a column on issues
+		// (the column is `closed_at`) and is not an allowed update field, so
+		// passing it made every close fail with
+		// "invalid field for update: completed_at" — silently leaving beads open
+		// whose linked external issue had already closed.
+		//
+		// Setting `closed_at` explicitly is also wrong: ManageClosedAt already
+		// stamps it whenever status transitions to closed, and an explicit value
+		// suppresses that stamp. Let it do its job.
 		updates := map[string]interface{}{
-			"status":       string(types.StatusClosed),
-			"completed_at": extIssue.CompletedAt,
+			"status": string(types.StatusClosed),
 		}
 		if existing.CloseReason == "" {
 			reason := "Closed via linked external issue " + extIssue.Identifier
