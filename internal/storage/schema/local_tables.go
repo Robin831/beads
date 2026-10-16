@@ -3,12 +3,14 @@ package schema
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
+	"sync"
 )
 
 // mainWorkNeeded is migrationWorkNeeded without the ignored (clone-local) series: what the versioned schema itself
 // still needs.
-func mainWorkNeeded(ctx context.Context, db DBConn) (bool, error) {
+var mainWorkNeeded = func(ctx context.Context, db DBConn) (bool, error) {
 	if !mainSource.atLatest(ctx, db) {
 		return true, nil
 	}
@@ -42,8 +44,28 @@ func isPrivilegeDenied(err error) bool {
 	return strings.Contains(s, "command denied") || strings.Contains(s, "error 1142") || strings.Contains(s, "error 1044")
 }
 
-// localSeriesSkipNote is logged when an open skips the ignored series because the user cannot create its tables.
+var skipNoteOnce sync.Once
+
+// skipLocalSeries: only the ignored series is behind and this user cannot create its tables, so the pass is skipped
+// (noted once per process). Any error in deciding keeps the old behaviour.
+func skipLocalSeries(ctx context.Context, db DBConn) bool {
+	if mainNeeded, err := mainWorkNeeded(ctx, db); err != nil || mainNeeded {
+		return false
+	}
+	if may, err := userMayCreateTables(ctx, db); err != nil || may {
+		return false
+	}
+	skipNoteOnce.Do(func() {
+		var database string
+		if err := db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&database); err != nil {
+			database = "this database"
+		}
+		log.Print(localSeriesSkipNote(database))
+	})
+	return true
+}
+
 func localSeriesSkipNote(database string) string {
-	return fmt.Sprintf("schema migration: bd's clone-local tables (wisps, local metadata) are missing on %s and this Dolt user "+
-		"may not create them; opening without them (wisp commands fail until a user with CREATE opens this database)", database)
+	return fmt.Sprintf("schema migration: bd's clone-local tables (wisps, local metadata) are missing or behind on %s and this "+
+		"Dolt user may not create them; opening without them (wisp commands fail until a user with CREATE opens this database)", database)
 }

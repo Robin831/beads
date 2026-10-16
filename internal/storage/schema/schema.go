@@ -289,13 +289,8 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// Only the ignored series behind (a push into the branch empties those tables on a sql-server) and a user
 	// without CREATE: the pass would fail on its first statement, so the open goes ahead without them. A grants
 	// probe that errors keeps the old behaviour.
-	if mainNeeded, err := mainWorkNeeded(ctx, db); err == nil && !mainNeeded {
-		if may, err := userMayCreateTables(ctx, db); err == nil && !may {
-			var database string
-			_ = db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&database)
-			log.Print(localSeriesSkipNote(database))
-			return 0, nil
-		}
+	if skipLocalSeries(ctx, db) {
+		return 0, nil
 	}
 
 	dirtyBeforeAll, err := dirtyTables(ctx, db, false)
