@@ -13,7 +13,7 @@ import (
 func TestEmptyWispTablesLeavesNoWispTableInTheIssueTemplates(t *testing.T) {
 	for name, tmpl := range map[string]string{"mark": markBlockedTemplateForIssues(), "unmark": unmarkBlockedTemplateForIssues()} {
 		got := emptyWispTables(tmpl)
-		if regexp.MustCompile(`\b(FROM|JOIN)\s+wisp(s|_dependencies)\b`).MatchString(got) {
+		if regexp.MustCompile(`(?i)\b(FROM|JOIN)\s+wisp(s|_dependencies)\b`).MatchString(got) {
 			t.Errorf("%s: a wisp table is still read after the replacement:\n%s", name, got)
 		}
 		if !strings.Contains(got, "WHERE FALSE") {
@@ -23,8 +23,8 @@ func TestEmptyWispTablesLeavesNoWispTableInTheIssueTemplates(t *testing.T) {
 }
 
 func TestEmptyWispTablesToleratesAnyWhitespace(t *testing.T) {
-	got := emptyWispTables("SELECT 1 FROM\n\t\twisp_dependencies cd JOIN   wisps\nchild ON child.id = cd.issue_id")
-	if regexp.MustCompile(`\b(FROM|JOIN)\s+wisp(s|_dependencies)\b`).MatchString(got) {
+	got := emptyWispTables("SELECT 1 from\n\t\twisp_dependencies cd JOIN   wisps\nchild ON child.id = cd.issue_id")
+	if regexp.MustCompile(`(?i)\b(FROM|JOIN)\s+wisp(s|_dependencies)\b`).MatchString(got) {
 		t.Fatalf("a wisp table is still read after the replacement:\n%s", got)
 	}
 	if !strings.Contains(got, "FROM (SELECT issue_id") || !strings.Contains(got, "JOIN (SELECT id, status, is_blocked") || !strings.Contains(got, " cd JOIN") || !strings.Contains(got, "\nchild ON") {

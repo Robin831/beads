@@ -340,8 +340,8 @@ func unmarkBlockedTemplateForWisps() string {
 // recreate them. A statement that fails on their absence runs once more with each replaced by an empty table of the
 // columns these templates read, so the answer is the one an empty wisp table gives.
 var (
-	fromWispDependencies = regexp.MustCompile(`\bFROM\s+wisp_dependencies\b`)
-	joinWisps            = regexp.MustCompile(`\bJOIN\s+wisps\b`)
+	fromWispDependencies = regexp.MustCompile(`(?i)\bFROM\s+wisp_dependencies\b`)
+	joinWisps            = regexp.MustCompile(`(?i)\bJOIN\s+wisps\b`)
 )
 
 // emptyWispTables matches the table names whatever whitespace a template puts around them.
