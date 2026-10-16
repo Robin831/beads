@@ -286,6 +286,12 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	if !needed {
 		return 0, nil
 	}
+	// Only the ignored series behind (a push into the branch empties those tables on a sql-server) and a user
+	// without CREATE: the pass would fail on its first statement, so the open goes ahead without them. A grants
+	// probe that errors keeps the old behaviour.
+	if skipLocalSeries(ctx, db) {
+		return 0, nil
+	}
 
 	dirtyBeforeAll, err := dirtyTables(ctx, db, false)
 	if err != nil {
@@ -1077,8 +1083,11 @@ func migrationSQLTouchesTable(sqlText, table string) bool {
 // version applied; pass 0 for the latest (the production path — only the
 // MigrateUpTo test-support path passes a real bound).
 func (m migrationSource) migrate(ctx context.Context, db DBConn, upTo int) (int, bool, error) {
-	if _, err := db.ExecContext(ctx, m.bootstrapSQL()); err != nil {
-		return 0, false, fmt.Errorf("creating %s: %w", m.cursorTable, err)
+	// CREATE ... IF NOT EXISTS still needs the CREATE privilege, so it runs only when the cursor is missing.
+	if exists, err := sentinelTableExists(ctx, db, m.cursorTable); err != nil || !exists {
+		if _, err := db.ExecContext(ctx, m.bootstrapSQL()); err != nil {
+			return 0, false, fmt.Errorf("creating %s: %w", m.cursorTable, err)
+		}
 	}
 	columnAdded, err := m.ensureContentHashColumn(ctx, db)
 	if err != nil {
