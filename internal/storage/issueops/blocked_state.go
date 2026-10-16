@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -334,6 +335,23 @@ func unmarkBlockedTemplateForWisps() string {
 	`, waitsForGateBlockedSQL)
 }
 
+// The wisp tables are clone-local: a push into a sql-server branch empties them, and a user without CREATE cannot
+// recreate them. A statement that fails on their absence runs once more with each replaced by an empty table of the
+// columns these templates read, so the answer is the one an empty wisp table gives.
+var emptyWispTables = strings.NewReplacer(
+	"FROM wisp_dependencies ", "FROM (SELECT issue_id, type, depends_on_issue_id, depends_on_wisp_id, metadata FROM dependencies WHERE FALSE) ",
+	"JOIN wisps ", "JOIN (SELECT id, status, is_blocked FROM issues WHERE FALSE) ",
+)
+
+// A wisp UPDATE is not retried: with its own table absent there is nothing to update.
+func execWithOptionalWispsInTx(ctx context.Context, tx DBTX, query string, args ...any) (sql.Result, error) {
+	res, err := tx.ExecContext(ctx, query, args...)
+	if err != nil && isTableNotExistError(err) && strings.Contains(err.Error(), "wisp") && !strings.HasPrefix(strings.TrimSpace(query), "UPDATE wisps") {
+		return tx.ExecContext(ctx, emptyWispTables.Replace(query), args...)
+	}
+	return res, err
+}
+
 //nolint:gosec // G201: callers pass constant templates; only IN-clause placeholders are formatted in.
 func runMarkUnmarkBatchedInTx(ctx context.Context, tx DBTX, markTmpl, unmarkTmpl string, ids []string) (int64, error) {
 	var changed int64
@@ -344,14 +362,14 @@ func runMarkUnmarkBatchedInTx(ctx context.Context, tx DBTX, markTmpl, unmarkTmpl
 		}
 		placeholders, args := buildSQLInClause(ids[start:end])
 
-		res, err := tx.ExecContext(ctx, fmt.Sprintf(markTmpl, placeholders), args...)
+		res, err := execWithOptionalWispsInTx(ctx, tx, fmt.Sprintf(markTmpl, placeholders), args...)
 		if err != nil {
 			return changed, fmt.Errorf("recompute is_blocked (mark): %w", err)
 		}
 		n, _ := res.RowsAffected()
 		changed += n
 
-		res, err = tx.ExecContext(ctx, fmt.Sprintf(unmarkTmpl, placeholders), args...)
+		res, err = execWithOptionalWispsInTx(ctx, tx, fmt.Sprintf(unmarkTmpl, placeholders), args...)
 		if err != nil {
 			return changed, fmt.Errorf("recompute is_blocked (unmark): %w", err)
 		}
@@ -371,7 +389,7 @@ func runMarkBatchedInTx(ctx context.Context, tx DBTX, markTmpl string, ids []str
 		}
 		placeholders, args := buildSQLInClause(ids[start:end])
 
-		res, err := tx.ExecContext(ctx, fmt.Sprintf(markTmpl, placeholders), args...)
+		res, err := execWithOptionalWispsInTx(ctx, tx, fmt.Sprintf(markTmpl, placeholders), args...)
 		if err != nil {
 			return changed, fmt.Errorf("mark is_blocked: %w", err)
 		}
@@ -484,6 +502,9 @@ func loadBlockingDependersForIDsInTx(
 			`, t.table, targetCol)
 			rows, err := tx.QueryContext(ctx, query, id)
 			if err != nil {
+				if optionalBlockedTable(t.table) && isTableNotExistError(err) {
+					continue
+				}
 				return fmt.Errorf("%s: query: %w", t.errCtx, err)
 			}
 			for rows.Next() {
@@ -629,6 +650,9 @@ func appendChildrenInTx(
 	for _, parentID := range parentIDs {
 		rows, err := tx.QueryContext(ctx, query, parentID)
 		if err != nil {
+			if optionalBlockedTable(depTable) && isTableNotExistError(err) {
+				return nil
+			}
 			return fmt.Errorf("expand children from %s on %s: %w", depTable, parentCol, err)
 		}
 		for rows.Next() {
@@ -667,6 +691,9 @@ func loadWaitersWhoseSpawnerIsParentOfInTx(
 		WHERE issue_id = ? AND type = 'parent-child'
 	`, depTable), childID)
 	if err != nil {
+		if optionalBlockedTable(depTable) && isTableNotExistError(err) {
+			return nil
+		}
 		return fmt.Errorf("waiters on parent of %s: load parents: %w", childID, err)
 	}
 	var issueParentIDs, wispParentIDs []string
