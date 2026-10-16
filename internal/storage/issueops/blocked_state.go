@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/types"
@@ -338,16 +339,22 @@ func unmarkBlockedTemplateForWisps() string {
 // The wisp tables are clone-local: a push into a sql-server branch empties them, and a user without CREATE cannot
 // recreate them. A statement that fails on their absence runs once more with each replaced by an empty table of the
 // columns these templates read, so the answer is the one an empty wisp table gives.
-var emptyWispTables = strings.NewReplacer(
-	"FROM wisp_dependencies ", "FROM (SELECT issue_id, type, depends_on_issue_id, depends_on_wisp_id, metadata FROM dependencies WHERE FALSE) ",
-	"JOIN wisps ", "JOIN (SELECT id, status, is_blocked FROM issues WHERE FALSE) ",
+var (
+	fromWispDependencies = regexp.MustCompile(`(?i)\bFROM\s+wisp_dependencies\b`)
+	joinWisps            = regexp.MustCompile(`(?i)\bJOIN\s+wisps\b`)
 )
+
+// emptyWispTables matches the table names whatever whitespace a template puts around them.
+func emptyWispTables(query string) string {
+	query = fromWispDependencies.ReplaceAllString(query, "FROM (SELECT issue_id, type, depends_on_issue_id, depends_on_wisp_id, metadata FROM dependencies WHERE FALSE)")
+	return joinWisps.ReplaceAllString(query, "JOIN (SELECT id, status, is_blocked FROM issues WHERE FALSE)")
+}
 
 // A wisp UPDATE is not retried: with its own table absent there is nothing to update.
 func execWithOptionalWispsInTx(ctx context.Context, tx DBTX, query string, args ...any) (sql.Result, error) {
 	res, err := tx.ExecContext(ctx, query, args...)
 	if err != nil && isTableNotExistError(err) && strings.Contains(err.Error(), "wisp") && !strings.HasPrefix(strings.TrimSpace(query), "UPDATE wisps") {
-		return tx.ExecContext(ctx, emptyWispTables.Replace(query), args...)
+		return tx.ExecContext(ctx, emptyWispTables(query), args...)
 	}
 	return res, err
 }
